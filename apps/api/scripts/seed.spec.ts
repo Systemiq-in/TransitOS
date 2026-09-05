@@ -55,11 +55,18 @@ describe('seedSuperAdmin', () => {
   });
 
   it('rejects a password that fails the password policy', async () => {
+    const weakEmail = `seed-weak-${randomUUID()}@example.com`;
     await expect(
       seedSuperAdmin(tenantContextService, new PasswordService(), {
-        email: `seed-weak-${randomUUID()}@example.com`,
+        email: weakEmail,
         password: 'weak',
       }),
     ).rejects.toThrow();
+
+    const rows = await tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      async (manager) => manager.getRepository(User).find({ where: { email: weakEmail } }),
+    );
+    expect(rows).toHaveLength(0);
   });
 });

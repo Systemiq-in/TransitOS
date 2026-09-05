@@ -4,6 +4,7 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { AppConfigModule } from './config/config.module';
 import { TenancyModule } from './tenancy/tenancy.module';
 import { AuthModule } from './auth/auth.module';
+import { AuditModule } from './audit/audit.module';
 import { UsersModule } from './users/users.module';
 import { SchoolsModule } from './schools/schools.module';
 import { HealthController } from './health/health.controller';
@@ -19,6 +20,7 @@ import { GlobalHttpExceptionFilter } from './common/http-exception.filter';
     ThrottlerModule.forRoot({ throttlers: [{ ttl: 60_000, limit: 100 }] }),
     TenancyModule,
     AuthModule,
+    AuditModule,
     UsersModule,
     SchoolsModule,
   ],

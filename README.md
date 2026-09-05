@@ -44,6 +44,10 @@ for the design specs and `docs/superpowers/plans/` for implementation plans.
    set -a && source .env && set +a
    pnpm --filter @transitos/api db:bootstrap
    ```
+   
+   **Note:** Verify your `.env` has `DATABASE_URL` and `DATABASE_MIGRATION_URL` pointing to
+   port **55432** (not 5432), matching the `docker-compose.yml` mapping `["55432:5432"]`.
+   The `.env.example` template already has this configured.
 5. Run migrations:
    ```bash
    pnpm --filter @transitos/api migration:run
@@ -128,7 +132,12 @@ The README above documents the complete setup path. To verify it works:
 5. **MFA enrollment works** — `/auth/mfa/setup` returns a TOTP secret
 6. **Session management** — `/auth/logout` and `/auth/logout-all` revoke sessions
 7. **Audit logging enforced** — app role cannot UPDATE audit logs due to database permissions
-8. **All tests pass** — run `pnpm --filter @transitos/api test test:e2e lint`
+8. **All tests pass** — run the three test commands separately:
+   ```bash
+   pnpm --filter @transitos/api test
+   pnpm --filter @transitos/api test:e2e
+   pnpm --filter @transitos/api lint
+   ```
 
 ## What's here
 

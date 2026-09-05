@@ -44,12 +44,17 @@ export class AuthController {
   }
 
   @Roles('super_admin', 'school_admin')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @Post('mfa/setup')
   mfaSetup(@CurrentUser() user: AccessTokenClaims) {
     return this.mfaService.beginEnrollment(user.sub, user.sub);
   }
 
+  // Same limit as the public mfa/verify route: this also accepts a 6-digit TOTP
+  // guess, so an unlimited-attempt confirm endpoint would be a smaller, but
+  // equally guessable, backdoor into activating MFA.
   @Roles('super_admin', 'school_admin')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @Post('mfa/confirm')
   mfaConfirm(@CurrentUser() user: AccessTokenClaims, @Body() dto: MfaConfirmDto) {
     return this.mfaService.confirmEnrollment(user.sub, dto.totpCode);
@@ -62,11 +67,15 @@ export class AuthController {
     return this.authService.refresh(dto.refreshToken, deviceInfoOf(req));
   }
 
+  // Authenticated and idempotent, so a more generous limit than the credential-
+  // guessing routes above is enough to just absorb accidental double-submits.
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Post('logout')
   logout(@CurrentUser() user: AccessTokenClaims, @Body() dto: LogoutDto) {
     return this.authService.logout(dto.refreshToken, user.sub);
   }
 
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Post('logout-all')
   logoutAll(@CurrentUser() user: AccessTokenClaims) {
     return this.authService.logoutAll(user.sub);

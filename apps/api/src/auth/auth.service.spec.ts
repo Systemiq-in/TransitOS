@@ -100,6 +100,14 @@ describe('AuthService', () => {
     );
   }
 
+  /** Simulates an admin disabling an account mid-flow (e.g. mid-MFA-challenge, or after a refresh token was issued). */
+  async function disableUser(userId: string): Promise<void> {
+    await tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      (manager) => manager.query(`UPDATE core.users SET status = 'disabled' WHERE id = $1`, [userId]),
+    );
+  }
+
   it('logs in a driver (no MFA) directly with tokens', async () => {
     await createUser(emailFor('driver-a'), 'driver', 'Correct-Horse9!');
 
@@ -268,5 +276,92 @@ describe('AuthService', () => {
     await expect(
       tenantContextService.runWithTenant(null, () => authService.refresh(second.refreshToken, 'device-B')),
     ).rejects.toThrow();
+  });
+
+  // Finding 1 (fix round 1): a user disabled after issuing a refresh token must
+  // not be able to keep refreshing, and a user disabled mid-MFA-challenge must
+  // not be able to complete that challenge.
+  it('rejects refresh() once the account has been disabled since the token was issued', async () => {
+    const email = emailFor('disabled-refresh');
+    const userId = await createUser(email, 'parent', 'Correct-Horse9!');
+
+    const login = await tenantContextService.runWithTenant(null, () =>
+      authService.login({ emailOrPhone: email, password: 'Correct-Horse9!' }, 'device-A', '127.0.0.1'),
+    );
+    if (login.mfaRequired) throw new Error('unexpected mfa challenge');
+
+    await disableUser(userId);
+
+    await expect(
+      tenantContextService.runWithTenant(null, () => authService.refresh(login.refreshToken, 'device-A')),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  it('rejects completeMfaChallenge() once the account has been disabled since the challenge was issued', async () => {
+    const email = emailFor('disabled-mfa');
+    const userId = await createUser(email, 'school_admin', 'Correct-Horse9!');
+    const { secret } = await tenantContextService.runWithTenant(null, () =>
+      mfaService.beginEnrollment(userId, email),
+    );
+    await tenantContextService.runWithTenant(null, () =>
+      mfaService.confirmEnrollment(userId, authenticator.generate(secret)),
+    );
+
+    const loginResult = await tenantContextService.runWithTenant(null, () =>
+      authService.login({ emailOrPhone: email, password: 'Correct-Horse9!' }, 'device-A', '127.0.0.1'),
+    );
+    if (!loginResult.mfaRequired) throw new Error('expected an MFA challenge');
+
+    await disableUser(userId);
+
+    await expect(
+      tenantContextService.runWithTenant(null, () =>
+        authService.completeMfaChallenge(
+          loginResult.mfaChallengeToken,
+          authenticator.generate(secret),
+          'device-A',
+          '127.0.0.1',
+        ),
+      ),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  // Finding 2 (fix round 1): a nonexistent or inactive account must not skip the
+  // Argon2id comparison — see password.service.spec.ts for the dummy-hash unit
+  // test, and the fix report for a rough timing comparison.
+  it('still performs a password comparison (via the dummy hash) when the account does not exist', async () => {
+    const verifySpy = jest.spyOn(passwordService, 'verify');
+    verifySpy.mockClear();
+
+    await expect(
+      tenantContextService.runWithTenant(null, () =>
+        authService.login(
+          { emailOrPhone: emailFor('still-does-not-exist'), password: 'Wrong-Password9!' },
+          'device-A',
+          '127.0.0.1',
+        ),
+      ),
+    ).rejects.toThrow(UnauthorizedException);
+
+    expect(verifySpy).toHaveBeenCalledTimes(1);
+    verifySpy.mockRestore();
+  });
+
+  it('still performs a password comparison (via the dummy hash) for a disabled account', async () => {
+    const email = emailFor('disabled-login');
+    const userId = await createUser(email, 'parent', 'Correct-Horse9!');
+    await disableUser(userId);
+
+    const verifySpy = jest.spyOn(passwordService, 'verify');
+    verifySpy.mockClear();
+
+    await expect(
+      tenantContextService.runWithTenant(null, () =>
+        authService.login({ emailOrPhone: email, password: 'Correct-Horse9!' }, 'device-A', '127.0.0.1'),
+      ),
+    ).rejects.toThrow(UnauthorizedException);
+
+    expect(verifySpy).toHaveBeenCalledTimes(1);
+    verifySpy.mockRestore();
   });
 });

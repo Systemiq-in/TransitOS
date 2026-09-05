@@ -29,4 +29,21 @@ describe('PasswordService', () => {
     const hash = await service.hash('Correct-Horse9!');
     expect(hash).toMatch(/^\$argon2id\$v=19\$m=65536,t=3,p=1\$/);
   });
+
+  it('verifyDummy() always resolves false, regardless of the input', async () => {
+    expect(await service.verifyDummy('anything')).toBe(false);
+    expect(await service.verifyDummy('')).toBe(false);
+  });
+
+  it('verifyDummy() computes the dummy hash only once across repeated calls', async () => {
+    // A fresh instance, since the shared `service` above may already have a
+    // cached dummy hash from an earlier test in this file.
+    const freshService = new PasswordService();
+    const hashSpy = jest.spyOn(freshService, 'hash');
+    await freshService.verifyDummy('a');
+    await freshService.verifyDummy('b');
+    await freshService.verifyDummy('c');
+    expect(hashSpy).toHaveBeenCalledTimes(1);
+    hashSpy.mockRestore();
+  });
 });

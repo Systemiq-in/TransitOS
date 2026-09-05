@@ -47,6 +47,10 @@ export class AuthService {
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['false']);
 
     if (!user || user.status !== 'active') {
+      // Finding 2: still perform an Argon2id comparison so this path costs
+      // roughly the same as a wrong-password check on a real, active account —
+      // otherwise the early return is a timing oracle for account enumeration.
+      await this.passwordService.verifyDummy(input.password);
       throw new UnauthorizedException('Invalid credentials');
     }
     const passwordOk = await this.passwordService.verify(user.passwordHash, input.password);
@@ -85,7 +89,11 @@ export class AuthService {
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['true']);
     const user = await manager.getRepository(User).findOne({ where: { id: userId } });
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['false']);
-    if (!user) {
+    // Finding 1: a valid, unexpired challenge token proves nothing about the
+    // account's *current* status — it was issued against the status at login
+    // time. Re-check here so disabling an account during the challenge window
+    // actually blocks the session it's meant to prevent.
+    if (!user || user.status !== 'active') {
       throw new UnauthorizedException('User no longer exists');
     }
 
@@ -107,7 +115,11 @@ export class AuthService {
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['true']);
     const user = await manager.getRepository(User).findOne({ where: { id: rotated.userId } });
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['false']);
-    if (!user) {
+    // Finding 1: without this, a disabled account keeps minting fresh access
+    // tokens off its still-valid refresh token until that refresh token expires
+    // (up to REFRESH_TOKEN_TTL_SECONDS later) — disabling wouldn't actually cut
+    // the account off in any useful timeframe.
+    if (!user || user.status !== 'active') {
       throw new UnauthorizedException('User no longer exists');
     }
 

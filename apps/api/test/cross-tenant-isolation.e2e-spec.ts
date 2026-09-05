@@ -5,6 +5,15 @@ import { DataSource } from 'typeorm';
 import { createTestApp } from './helpers/app';
 import { TenantContextService } from '../src/tenancy/tenant-context.service';
 import { PasswordService } from '../src/auth/password.service';
+import { SchoolsController } from '../src/schools/schools.controller';
+
+// Only the controller's own `assertCanAccessSchool` check is neutralised below,
+// via a prototype spy — never a real DB-level bypass. The type cast reaches
+// past the method's `private` visibility, which TypeScript only enforces at
+// compile time; jest.spyOn needs the runtime property regardless of who else
+// can call it, and this file mocks nothing about the RLS session variables
+// TenancyInterceptor sets from the caller's real JWT.
+type ControllerWithGuard = { assertCanAccessSchool: (user: unknown, schoolId: string) => void };
 
 describe('Cross-tenant isolation (e2e)', () => {
   let app: INestApplication;
@@ -101,5 +110,42 @@ describe('Cross-tenant isolation (e2e)', () => {
         displayName: 'Sneaky',
       })
       .expect(403);
+  });
+
+  it('still isolates tenants at the RLS layer when the controller guard is bypassed', async () => {
+    // Neutralise only the app-layer check — RLS, TenancyInterceptor, and the
+    // guards are all still live and driven by a real JWT from a real login.
+    const spy = jest
+      .spyOn(SchoolsController.prototype as unknown as ControllerWithGuard, 'assertCanAccessSchool')
+      .mockImplementation(() => undefined);
+
+    try {
+      const login = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ emailOrPhone: adminAEmail, password: 'Correct-Horse9!' })
+        .expect(201);
+      const { accessToken } = login.body.data;
+
+      // listUsers() never checks whether the school itself exists — it just
+      // runs `WHERE school_id = schoolB` inside a transaction TenancyInterceptor
+      // scoped to Admin A's own tenant (current_school_id = schoolA, from the
+      // JWT). With the app-layer guard gone, RLS's `users_tenant_all` policy is
+      // the only thing left: it ANDs `school_id = current_school_id` onto that
+      // query, so the request still succeeds (the endpoint isn't a 404/403 kind
+      // of failure at the RLS layer) but the result set is empty — School B's
+      // own seeded user, Parent B, never appears.
+      const response = await request(app.getHttpServer())
+        .get(`/schools/${schoolB}/users`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.total).toBe(0);
+      expect(response.body.data.items).toEqual([]);
+      const emails = (response.body.data.items as Array<{ email: string }>).map((u) => u.email);
+      expect(emails).not.toContain(parentBEmail);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

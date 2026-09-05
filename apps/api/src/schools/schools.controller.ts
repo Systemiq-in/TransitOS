@@ -18,16 +18,20 @@ import { CreateSchoolDto } from './dto/create-school.dto';
 import { CreateSchoolUserDto } from './dto/create-school-user.dto';
 import { SchoolResponseDto, toSchoolResponse } from './dto/school-response.dto';
 
-/** Throws unless the caller is a super_admin or the school_admin of exactly this school. */
-function assertCanAccessSchool(user: AccessTokenClaims, schoolId: string): void {
-  if (user.role === 'super_admin') return;
-  if (user.role === 'school_admin' && user.schoolId === schoolId) return;
-  throw new ForbiddenException('You do not have permission to access this school');
-}
-
 @Controller('schools')
 export class SchoolsController {
   constructor(private readonly schoolsService: SchoolsService) {}
+
+  // A regular (non-arrow) instance method — not a free function — so that a
+  // test can neutralise it via `jest.spyOn(SchoolsController.prototype, ...)`
+  // without replacing the whole controller, to prove RLS is a real backstop
+  // and not merely a second copy of this same check.
+  /** Throws unless the caller is a super_admin or the school_admin of exactly this school. */
+  private assertCanAccessSchool(user: AccessTokenClaims, schoolId: string): void {
+    if (user.role === 'super_admin') return;
+    if (user.role === 'school_admin' && user.schoolId === schoolId) return;
+    throw new ForbiddenException('You do not have permission to access this school');
+  }
 
   @Roles('super_admin')
   @Post()
@@ -59,7 +63,7 @@ export class SchoolsController {
     @CurrentUser() user: AccessTokenClaims,
     @Param('id') id: string,
   ): Promise<SchoolResponseDto> {
-    assertCanAccessSchool(user, id);
+    this.assertCanAccessSchool(user, id);
     const school = await this.schoolsService.findById(id);
     if (!school) {
       throw new NotFoundException('School not found');
@@ -74,7 +78,7 @@ export class SchoolsController {
     @Param('id') id: string,
     @Body() dto: CreateSchoolUserDto,
   ): Promise<UserResponseDto> {
-    assertCanAccessSchool(user, id);
+    this.assertCanAccessSchool(user, id);
     const created = await this.schoolsService.createUser(id, dto);
     return toUserResponse(created);
   }
@@ -86,7 +90,7 @@ export class SchoolsController {
     @Param('id') id: string,
     @Query() pagination: PaginationQueryDto,
   ): Promise<PaginatedResponse<UserResponseDto>> {
-    assertCanAccessSchool(user, id);
+    this.assertCanAccessSchool(user, id);
     const { items, total } = await this.schoolsService.listUsers(
       id,
       pagination.limit,

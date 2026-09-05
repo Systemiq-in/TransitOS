@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { DataSource } from 'typeorm';
 import { TenantContextService } from '../tenancy/tenant-context.service';
 import { AuditService } from './audit.service';
@@ -55,15 +56,25 @@ describe('AuditService', () => {
   });
 
   it('accepts a null schoolId for platform-level actions', async () => {
+    const platformEntityId = randomUUID();
+
     await tenantContextService.runWithTenant(null, () =>
-      service.record({ schoolId: null, actorUserId: null, action: 'school.created' }),
+      service.record({
+        schoolId: null,
+        actorUserId: null,
+        action: 'school.created',
+        entityId: platformEntityId,
+      }),
     );
 
     const rows = await tenantContextService.runWithTenant(
       { sub: 'root', schoolId: null, role: 'super_admin', isSuperAdmin: true },
       (manager) =>
-        manager.query(`SELECT action FROM audit.audit_logs WHERE school_id IS NULL AND action = 'school.created'`),
+        manager.query(
+          `SELECT action FROM audit.audit_logs WHERE school_id IS NULL AND action = 'school.created' AND entity_id = $1`,
+          [platformEntityId],
+        ),
     );
-    expect(rows.length).toBeGreaterThanOrEqual(1);
+    expect(rows).toHaveLength(1);
   });
 });

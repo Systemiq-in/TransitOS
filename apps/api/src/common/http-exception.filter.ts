@@ -9,8 +9,9 @@ export class GlobalHttpExceptionFilter implements ExceptionFilter {
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
       const body = exception.getResponse();
-      const message =
-        typeof body === 'string' ? body : ((body as { message?: string }).message ?? exception.message);
+      const rawMessage =
+        typeof body === 'string' ? body : ((body as { message?: string | string[] }).message ?? exception.message);
+      const message = Array.isArray(rawMessage) ? rawMessage.join(', ') : rawMessage;
 
       response.status(status).json({
         success: false,

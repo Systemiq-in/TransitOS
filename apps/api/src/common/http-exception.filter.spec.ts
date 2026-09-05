@@ -1,4 +1,4 @@
-import { ArgumentsHost, BadRequestException } from '@nestjs/common';
+import { ArgumentsHost, BadRequestException, UnauthorizedException } from '@nestjs/common';
 import { QueryFailedError } from 'typeorm';
 import { GlobalHttpExceptionFilter } from './http-exception.filter';
 
@@ -22,6 +22,39 @@ describe('GlobalHttpExceptionFilter', () => {
     expect(json).toHaveBeenCalledWith({
       success: false,
       error: { code: 'BAD_REQUEST', message: 'bad input' },
+    });
+  });
+
+  it('normalizes ValidationPipe array messages to a joined string', () => {
+    const filter = new GlobalHttpExceptionFilter();
+    const { host, status, json } = buildHost();
+
+    // ValidationPipe throws BadRequestException with message: string[]
+    const exception = new BadRequestException({
+      statusCode: 400,
+      error: 'Bad Request',
+      message: ['email must be an email', 'age must be a number'],
+    });
+
+    filter.catch(exception, host);
+
+    expect(status).toHaveBeenCalledWith(400);
+    expect(json).toHaveBeenCalledWith({
+      success: false,
+      error: { code: 'BAD_REQUEST', message: 'email must be an email, age must be a number' },
+    });
+  });
+
+  it('preserves 401 status for UnauthorizedException', () => {
+    const filter = new GlobalHttpExceptionFilter();
+    const { host, status, json } = buildHost();
+
+    filter.catch(new UnauthorizedException('invalid token'), host);
+
+    expect(status).toHaveBeenCalledWith(401);
+    expect(json).toHaveBeenCalledWith({
+      success: false,
+      error: { code: 'UNAUTHORIZED', message: 'invalid token' },
     });
   });
 

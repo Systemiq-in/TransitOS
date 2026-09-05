@@ -58,6 +58,19 @@ The full platform is far too large for one specification. It is decomposed so ea
 
 Sub-project 1 is the substrate everything else builds on; it deliberately ships no product features.
 
+### Separate deliverable — marketing landing page (not yet started)
+
+A public landing page for TransitOS, to be built **after** the platform work above. It is tracked separately rather than as a ninth sub-project: different audience, different stack (a static marketing site), and no dependency on the platform's architecture.
+
+It is worth writing down now what it must argue, because that reasoning is already settled in this document and should not be re-derived from scratch later:
+
+- **Audience is the buyer, not the end user** — principals, school management, and transport coordinators. Not parents, who are users of the product but not purchasers of it.
+- **Lead with ROI and operational control, never "we have GPS."** Tracking is commoditised and, in Kerala, the state gives it away free. The page must open on the operational pain: transport-office phone calls, manual attendance registers, fees chased by hand, no verified record when a parent disputes a drop-off, and a breakdown that takes an hour to re-route.
+- **Position against bundling.** The competitive claim is transport *depth*, not feature count — the opposite of the all-in-one ERPs whose transport module is one tab among thirty.
+- **Privacy as a selling point, not fine print.** This system handles children's location data; the isolation guarantees, DPDP-readiness, consent records, and time-limited support access are commercially persuasive to premium schools, not just legally necessary.
+- **Kerala-first framing**, with Malayalam and English both first-class.
+- Concrete proof beats adjectives: the verified boarding/drop-off record, the substitute-driver flow, and compliance expiry alerts are the demos worth showing.
+
 ---
 
 ## 5. The workflow the product is optimised around

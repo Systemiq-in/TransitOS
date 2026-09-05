@@ -100,6 +100,8 @@ Verified live state: migrations `InitSchemas`, `CreateSchools`, `CreateUsers`, `
 
 **Remaining tasks (10–23)**, each fully specified in the plan: 10 JWT token service · 11 tenancy context (AsyncLocalStorage + interceptor) · 12 refresh-token lifecycle · 13 TOTP MFA · 14 audit service · 15 guards/decorators · 16 AuthService + controller · 17 response envelope + exception filter · 18 UsersModule · 19 SchoolsModule · 20 AppModule wiring · 21 seed script · 22 e2e tests · 23 README + acceptance.
 
+**Queued after all platform work — marketing landing page.** Requested by the user; to be built last, after Foundations and (at minimum) enough of the platform to demo. Tracked as a standalone deliverable, not a ninth sub-project, since it shares no stack or architecture with the platform. What it must argue — audience, positioning, and the specific proof points — is written down in `PROJECT-REQUIREMENTS.md` §4 so it does not have to be re-derived.
+
 ---
 
 ## 4. The process being followed

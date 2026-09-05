@@ -32,3 +32,4 @@ jobs:
       - run: pnpm lint
       - run: pnpm --filter @transitos/api db:bootstrap
       - run: pnpm test
+      - run: pnpm --filter @transitos/api test:e2e

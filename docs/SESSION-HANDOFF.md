@@ -89,8 +89,10 @@ Tasks 1–5 are complete and reviewed clean. Task 6 is implemented and its revie
 | 6 — refresh_tokens / password_history / mfa_credentials | complete, review clean | `2139950` |
 | 7 — `audit.audit_logs`, append-only via grants | complete, review clean | `b47b711` |
 | 8 — AES-256-GCM secret box | complete, review clean (1 fix round) | `348fc3e`, `315b4e5` |
-| 9 — Argon2id + password policy | implemented, review in flight | `23fe228`, `1834bb4` |
-| 10–23 | not started | — |
+| 9 — Argon2id + password policy | complete, review clean (1 fix round) | `23fe228`, `1834bb4`, `1b7dda5` |
+| 10 — JWT access + MFA-challenge tokens | complete, review clean (1 fix round) | `2208b20`, `1a14789` |
+| 11 — tenancy context (ALS + interceptor) | implemented, review in flight | `eeb123b` |
+| 12–23 | not started | — |
 
 (`d11875c` between tasks 7 and 8 is the docs commit that added this file, ARCHITECTURE.md and PROJECT-REQUIREMENTS.md.)
 
@@ -149,7 +151,10 @@ These resolve gaps and conflicts found in the plan or environment. They are bind
 - **R21** — `PasswordService` pins Argon2id parameters explicitly: `memoryCost: 65536, timeCost: 3, parallelism: 1`. Library defaults have changed across argon2 releases and would otherwise shift the auth profile silently on a dependency bump. Memory hardness is unchanged from the old default, so this is not a security reduction; only `parallelism` dropped (4 → 1) to cut per-hash thread pressure. Argon2 encodes parameters in the PHC hash string, so these stay retunable later with no rehash.
 - **R24** — **conflict between the two standards documents, resolved toward security.** The performance standard targets sub-300ms API responses; the security standard mandates Argon2id, which is deliberately slow. For `/auth/login` security wins: the slowness *is* the defence against offline cracking of a stolen password database. Login is governed by the cold-login budget (<3s on 4G) instead, recorded as a documented exception in `engineering-standards.md` P1. **No task may weaken hashing parameters to chase a latency number** — fix slow-feeling login with optimistic UI and background refresh, never with a weaker KDF.
 
-**Still to apply (tasks 10–23):**
+- **R25** — `TokenService.signAccessToken` embeds `purpose: 'access'` and `verifyAccessToken` requires it via a **positive** check (`!== 'access'`), so a future third token type fails safe. Without this, an MFA challenge token — issued after the password check but *before* the second factor, and signed with the same secret — verified as an access token, admitting a caller who never completed MFA to any route without an explicit `@Roles` requirement. The exported `AccessTokenClaims` stays at four fields; `purpose` is stripped from the returned object.
+- **R26** — Task 11's "super_admin sees every school" assertion is scoped `WHERE id IN (...)` to the run's own ids. Under super_admin RLS applies no filter, so accumulated rows from earlier runs break an exact assertion. The tenant-scoped tests stay deliberately unscoped: there RLS itself does the filtering, and that is the property under test.
+
+**Still to apply (tasks 12–23):**
 
 - **R22 — Task 19:** `GET /schools` and `GET /schools/:id/users` must ship paginated (limit/offset, sane default, hard maximum). Retrofitting pagination onto a shipped endpoint is a breaking change for every client, and a school's user list reaches thousands once drivers, attendants and parents load.
 - **R23 — Task 20:** enable gzip response compression in the Nest bootstrap.

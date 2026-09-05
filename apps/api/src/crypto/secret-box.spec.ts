@@ -21,8 +21,12 @@ describe('secret-box', () => {
   });
 
   it('fails to decrypt tampered ciphertext (auth tag check)', () => {
-    const ciphertext = encryptSecret('JBSWY3DPEHPK3PXP', key);
-    const tampered = ciphertext.slice(0, -2) + (ciphertext.slice(-2) === 'AA' ? 'BB' : 'AA');
+    const payload = encryptSecret('JBSWY3DPEHPK3PXP', key);
+    const lastByte = parseInt(payload.slice(-2), 16);
+    const flipped = (lastByte ^ 0xff).toString(16).padStart(2, '0');
+    const tampered = payload.slice(0, -2) + flipped;
+
+    expect(tampered).not.toBe(payload);
     expect(() => decryptSecret(tampered, key)).toThrow();
   });
 });

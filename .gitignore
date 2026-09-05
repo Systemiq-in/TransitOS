@@ -11,4 +11,5 @@ coverage/
 
 # Agent scratch: worktrees and subagent-driven-development workspaces
 .claude/worktrees/
+.worktrees/
 .superpowers/

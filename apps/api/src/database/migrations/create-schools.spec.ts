@@ -69,6 +69,22 @@ describe('core.schools RLS', () => {
     expect(rows).toHaveLength(0);
   });
 
+  it('denies access without erroring when the tenant context is an empty string', async () => {
+    const runner = app.createQueryRunner();
+    await runner.startTransaction();
+    await runner.query(`SET LOCAL app.is_super_admin = 'false'`);
+    await runner.query(`SET LOCAL app.current_school_id = ''`);
+
+    const rows = await runner.query(
+      `SELECT id FROM core.schools WHERE id IN ('${schoolA}','${schoolB}')`,
+    );
+
+    await runner.rollbackTransaction();
+    await runner.release();
+
+    expect(rows).toEqual([]);
+  });
+
   it('refuses to let a school-scoped session insert a new school', async () => {
     const runner = app.createQueryRunner();
     await runner.startTransaction();

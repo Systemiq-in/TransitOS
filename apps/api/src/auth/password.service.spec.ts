@@ -24,4 +24,9 @@ describe('PasswordService', () => {
     const b = await service.hash('Correct-Horse9!');
     expect(a).not.toBe(b);
   });
+
+  it('pins the Argon2id parameters into the hash', async () => {
+    const hash = await service.hash('Correct-Horse9!');
+    expect(hash).toMatch(/^\$argon2id\$v=19\$m=65536,t=3,p=1\$/);
+  });
 });

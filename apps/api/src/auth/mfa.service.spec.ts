@@ -66,6 +66,14 @@ describe('MfaService', () => {
     expect(await runNull(() => service.verifyCode(userId, '000000'))).toBe(false);
   });
 
+  it('returns false for a correct code when enrollment was never confirmed', async () => {
+    const { secret } = await runNull(() =>
+      service.beginEnrollment(userId, `mfa-test-unconfirmed-${runId}@example.com`),
+    );
+    const validCode = authenticator.generate(secret);
+    expect(await runNull(() => service.verifyCode(userId, validCode))).toBe(false);
+  });
+
   it('stores the secret encrypted, not in plaintext', async () => {
     const { secret } = await runNull(() => service.beginEnrollment(userId, testEmail));
     const manager = dataSource.manager;
@@ -89,6 +97,7 @@ describe('MfaService', () => {
   it('rejects confirmEnrollment with an invalid code', async () => {
     await runNull(() => service.beginEnrollment(userId, `mfa-test-2-${runId}@example.com`));
     await expect(runNull(() => service.confirmEnrollment(userId, '000000'))).rejects.toThrow();
+    expect(await runNull(() => service.isEnabled(userId))).toBe(false);
   });
 
   it('rejects confirmEnrollment when enrollment was never begun', async () => {

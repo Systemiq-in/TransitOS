@@ -2,7 +2,7 @@
 
 **Purpose:** everything a fresh session (or a different person) needs to resume this build without re-deriving anything. If the assistant's memory is wrong and this document disagrees with it, **this document and `git log` win.**
 
-Last updated: 2026-09-05, after Task 6 implementation (Task 6 review in flight).
+Last updated: 2026-09-05, after Task 9 implementation (Task 9 review in flight).
 
 ---
 
@@ -86,12 +86,19 @@ Tasks 1–5 are complete and reviewed clean. Task 6 is implemented and its revie
 | 3 — two DB roles, `core`/`audit` schemas, data sources | complete, review clean (1 fix round) | `97ec4d3`, `85f5972` |
 | 4 — `core.schools` + RLS | complete, review clean (1 fix round) | `39a23c6`, `9dca638` |
 | 5 — `core.users` + RLS + login carve-out | complete, review clean | `700996e` |
-| 6 — refresh_tokens / password_history / mfa_credentials | implemented, review in flight | `2139950` |
-| 7–23 | not started | — |
+| 6 — refresh_tokens / password_history / mfa_credentials | complete, review clean | `2139950` |
+| 7 — `audit.audit_logs`, append-only via grants | complete, review clean | `b47b711` |
+| 8 — AES-256-GCM secret box | complete, review clean (1 fix round) | `348fc3e`, `315b4e5` |
+| 9 — Argon2id + password policy | implemented, review in flight | `23fe228`, `1834bb4` |
+| 10–23 | not started | — |
 
-Verified live state: migrations `InitSchemas`, `CreateSchools`, `CreateUsers`, `CreateAuthTables` applied; tables `core.schools`, `core.users`, `core.refresh_tokens`, `core.password_history`, `core.mfa_credentials` exist. 28 tests passing.
+(`d11875c` between tasks 7 and 8 is the docs commit that added this file, ARCHITECTURE.md and PROJECT-REQUIREMENTS.md.)
 
-**Remaining tasks (7–23)**, each fully specified in the plan: 7 audit_logs + immutability · 8 AES-256-GCM secret box · 9 Argon2id + password policy · 10 JWT token service · 11 tenancy context (AsyncLocalStorage + interceptor) · 12 refresh-token lifecycle · 13 TOTP MFA · 14 audit service · 15 guards/decorators · 16 AuthService + controller · 17 response envelope + exception filter · 18 UsersModule · 19 SchoolsModule · 20 AppModule wiring · 21 seed script · 22 e2e tests · 23 README + acceptance.
+Verified live state: migrations `InitSchemas`, `CreateSchools`, `CreateUsers`, `CreateAuthTables`, `CreateAuditLogs` applied; tables `core.schools`, `core.users`, `core.refresh_tokens`, `core.password_history`, `core.mfa_credentials`, `audit.audit_logs` exist, all with `gen_random_uuid()` id defaults. 49 tests passing.
+
+**The database layer is finished.** Everything remaining is application code.
+
+**Remaining tasks (10–23)**, each fully specified in the plan: 10 JWT token service · 11 tenancy context (AsyncLocalStorage + interceptor) · 12 refresh-token lifecycle · 13 TOTP MFA · 14 audit service · 15 guards/decorators · 16 AuthService + controller · 17 response envelope + exception filter · 18 UsersModule · 19 SchoolsModule · 20 AppModule wiring · 21 seed script · 22 e2e tests · 23 README + acceptance.
 
 ---
 
@@ -136,7 +143,14 @@ These resolve gaps and conflicts found in the plan or environment. They are bind
 - **R18** — tests generate unique identifiers per run (`core.users.email` is UNIQUE and the test DB persists); the suite must pass twice consecutively.
 - **R19** — the carve-out's "no write power" is proven semantically (attempt the write, then re-read under super_admin and assert unchanged), never by asserting on a TypeORM `query()` return shape.
 
-**Still to apply (tasks 7–23):**
+- **R20** — Task 8's tamper test was made an unconditional bit flip (`byte ^ 0xff`) with an explicit `expect(tampered).not.toBe(payload)`. The original guard compared lowercase hex against uppercase `'AA'`, making it dead code and the test flaky ~1/256 of runs.
+- **R21** — `PasswordService` pins Argon2id parameters explicitly: `memoryCost: 65536, timeCost: 3, parallelism: 1`. Library defaults have changed across argon2 releases and would otherwise shift the auth profile silently on a dependency bump. Memory hardness is unchanged from the old default, so this is not a security reduction; only `parallelism` dropped (4 → 1) to cut per-hash thread pressure. Argon2 encodes parameters in the PHC hash string, so these stay retunable later with no rehash.
+- **R24** — **conflict between the two standards documents, resolved toward security.** The performance standard targets sub-300ms API responses; the security standard mandates Argon2id, which is deliberately slow. For `/auth/login` security wins: the slowness *is* the defence against offline cracking of a stolen password database. Login is governed by the cold-login budget (<3s on 4G) instead, recorded as a documented exception in `engineering-standards.md` P1. **No task may weaken hashing parameters to chase a latency number** — fix slow-feeling login with optimistic UI and background refresh, never with a weaker KDF.
+
+**Still to apply (tasks 10–23):**
+
+- **R22 — Task 19:** `GET /schools` and `GET /schools/:id/users` must ship paginated (limit/offset, sane default, hard maximum). Retrofitting pagination onto a shipped endpoint is a breaking change for every client, and a school's user list reaches thousands once drivers, attendants and parents load.
+- **R23 — Task 20:** enable gzip response compression in the Nest bootstrap.
 
 - **R5 — Task 11:** use `firstValueFrom(next.handle())`, not the deprecated `.toPromise()`.
 - **R6 — Task 16:** `AuthService` must catch failures from `refreshTokenService.rotate()` and `tokenService.verifyMfaChallenge()` and rethrow `UnauthorizedException`. As written they throw plain `Error`, which the global filter maps to **500**, while the spec and Task 22's e2e both require **401**.

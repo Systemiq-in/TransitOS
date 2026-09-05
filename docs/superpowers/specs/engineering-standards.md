@@ -185,3 +185,53 @@ blocking on sensitive screens.
 
 Never log passwords, JWTs, payment tokens, or raw GPS coordinates at debug level;
 mask sensitive values in any log output.
+
+---
+
+# Part II — Performance & Speed Standards
+
+Source: user-provided "SYSTEMIQ TransitOS Performance & Speed Engineering Standards" (2026-09-05). Same convention as Part I: each control is tagged with the sub-project that owns it. The guiding target is that the product feels instant on the low-end Android devices that Indian school drivers and parents actually carry, not just on flagships.
+
+## P1. Targets — [measured in Sub-project 8; designed for throughout]
+
+App launch < 2s · screen transitions < 200ms · 60 FPS scrolling/animation · GPS visible < 1s · common API responses < 300ms · cold login < 3s on 4G.
+
+**Documented exception — authentication endpoints.** `/auth/login` cannot and must not meet the 300ms API target. Argon2id is deliberately slow; that slowness *is* the security control against offline cracking of a stolen password database. The binding target for login is the cold-login budget (< 3s), within which Argon2id's cost is a small and deliberate fraction. No task may weaken hashing parameters to chase an API latency number. Where login feels slow, fix it in perceived performance (optimistic UI, background token refresh), never in the KDF.
+
+## P2. Flutter client performance — [Sub-projects 4–5]
+
+Riverpod for state; minimise rebuilds via `ConsumerWidget`/`select()` and immutable state; `const` widgets; `ListView.builder`/`GridView.builder` for lists; no nested scroll views or deep widget trees; cached network images with placeholders; preload only critical assets; isolates for expensive computation; dispose controllers/streams/listeners.
+
+## P3. Offline-first experience — [Sub-project 4 (driver), Sub-project 5 (parent)]
+
+Local SQLite/Isar cache of routes, students, stops, recent trips. Open from cache first, sync in background. Queue attendance and GPS while offline and sync on reconnect. Delta sync only — never full-database downloads. Exponential backoff on retry; graceful degradation to offline mode on poor connectivity.
+
+## P4. API efficiency — [partly Sub-project 1, rest Sub-project 2 onward]
+
+Return only required fields (already the DTO convention — see Part I §5). **Pagination on every list endpoint** — retrofitting it is a breaking API change, so list endpoints ship paginated from the start. Gzip/Brotli compression. Batch requests where it removes round-trips. ETag/HTTP caching for static data [Sub-project 2+ — not useful for the small admin lists in Sub-project 1].
+
+## P5. Realtime GPS — [Sub-project 3]
+
+WebSockets, never polling. 3–5s updates while moving, reduced when stationary, tracking stopped entirely at trip end (battery). Redis holds live location; PostgreSQL holds history.
+
+## P6. Database performance — [Sub-project 1 for tenancy indexes; later per table]
+
+Index every column that policies and hot queries filter on — `school_id` above all, since **every** tenant-scoped query carries a `school_id` predicate from RLS, plus `route_id`, `student_id`, `trip_id` and the timestamp columns used for recency ordering. Avoid N+1; cache hot configuration in Redis [Sub-project 3+].
+
+Capacity note for Argon2id: memory cost is paid *per concurrent hash*. At the default 64 MiB, 100 simultaneous logins is ~6.4 GB of RAM — a real constraint at the stated scale. See Ruling R21 for the pinned parameters and the reasoning.
+
+## P7. Background processing — [Sub-project 7 onward]
+
+Reports, notification fan-out and payment reconciliation run in background workers, never inline in a request.
+
+## P8. Assets — [Sub-projects 5, 7]
+
+Compress before upload; WebP where supported; thumbnails first, full images on demand; lazy-load logos and documents.
+
+## P9. Scale envelope — [architectural, all sub-projects]
+
+10,000+ schools · 500,000+ students · 100,000+ buses · millions of GPS events daily. Served by modular architecture, feature flags, caching, and horizontal scaling — not by premature distribution.
+
+## P10. Performance monitoring — [Sub-project 8]
+
+Track app startup, API latency, screen render, GPS sync latency, memory, and crashes; alert on regression.

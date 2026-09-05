@@ -78,4 +78,10 @@ describe('TokenService', () => {
     });
     expect(() => service.verifyMfaChallenge(accessToken)).toThrow();
   });
+
+  it('rejects an MFA challenge token presented as an access token', () => {
+    const service = buildService();
+    const challenge = service.signMfaChallenge('user-1');
+    expect(() => service.verifyAccessToken(challenge)).toThrow();
+  });
 });

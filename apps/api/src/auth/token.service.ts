@@ -24,16 +24,28 @@ export class TokenService {
   ) {}
 
   signAccessToken(claims: AccessTokenClaims): string {
-    return this.jwtService.sign(claims, {
-      secret: this.configService.get('JWT_SECRET'),
-      expiresIn: this.configService.get('ACCESS_TOKEN_TTL_SECONDS'),
-    });
+    return this.jwtService.sign(
+      { ...claims, purpose: 'access' },
+      {
+        secret: this.configService.get('JWT_SECRET'),
+        expiresIn: this.configService.get('ACCESS_TOKEN_TTL_SECONDS'),
+      },
+    );
   }
 
   verifyAccessToken(token: string): AccessTokenClaims {
-    return this.jwtService.verify<AccessTokenClaims>(token, {
+    const payload = this.jwtService.verify<AccessTokenClaims & { purpose?: string }>(token, {
       secret: this.configService.get('JWT_SECRET'),
     });
+    if (payload.purpose !== 'access') {
+      throw new Error('Not an access token');
+    }
+    return {
+      sub: payload.sub,
+      schoolId: payload.schoolId,
+      role: payload.role,
+      isSuperAdmin: payload.isSuperAdmin,
+    };
   }
 
   signMfaChallenge(userId: string): string {

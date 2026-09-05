@@ -10,9 +10,11 @@ describe('RefreshTokenService', () => {
   let tenantContextService: TenantContextService;
   let service: RefreshTokenService;
   let userId: string;
+  let otherUserId: string;
 
   const runId = randomUUID();
   const testEmail = `refresh-test-${runId}@example.com`;
+  const otherTestEmail = `refresh-test-other-${runId}@example.com`;
 
   beforeAll(async () => {
     const migrator = await migrationDataSource.initialize();
@@ -34,6 +36,13 @@ describe('RefreshTokenService', () => {
           [testEmail],
         );
         userId = user.id;
+
+        const [other] = await manager.query(
+          `INSERT INTO core.users (role, email, password_hash, display_name)
+           VALUES ('super_admin', $1, 'hash', 'Other') RETURNING id`,
+          [otherTestEmail],
+        );
+        otherUserId = other.id;
       },
     );
   });
@@ -68,13 +77,21 @@ describe('RefreshTokenService', () => {
     await expect(runNull(() => service.rotate(rawToken, 'device-A'))).rejects.toThrow();
   });
 
-  it('revokeAllForUser() invalidates every session for that user', async () => {
+  it('revokeAllForUser() invalidates every session for that user, but not other users', async () => {
     const first = await runNull(() => service.issue(userId, 'device-A'));
     const second = await runNull(() => service.issue(userId, 'device-B'));
+    const untouched = await runNull(() => service.issue(otherUserId, 'device-A'));
+
     await runNull(() => service.revokeAllForUser(userId));
 
     await expect(runNull(() => service.rotate(first.rawToken, 'device-A'))).rejects.toThrow();
     await expect(runNull(() => service.rotate(second.rawToken, 'device-B'))).rejects.toThrow();
+
+    // If revokeAllForUser() ever dropped its user_id filter and wiped every
+    // user's tokens, this would fail: the other user's still-valid token
+    // must still rotate successfully.
+    const rotatedUntouched = await runNull(() => service.rotate(untouched.rawToken, 'device-A'));
+    expect(rotatedUntouched.userId).toBe(otherUserId);
   });
 
   it('rejects rotate() when the token is expired', async () => {

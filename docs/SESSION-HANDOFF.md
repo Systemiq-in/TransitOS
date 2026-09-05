@@ -91,8 +91,9 @@ Tasks 1–5 are complete and reviewed clean. Task 6 is implemented and its revie
 | 8 — AES-256-GCM secret box | complete, review clean (1 fix round) | `348fc3e`, `315b4e5` |
 | 9 — Argon2id + password policy | complete, review clean (1 fix round) | `23fe228`, `1834bb4`, `1b7dda5` |
 | 10 — JWT access + MFA-challenge tokens | complete, review clean (1 fix round) | `2208b20`, `1a14789` |
-| 11 — tenancy context (ALS + interceptor) | implemented, review in flight | `eeb123b` |
-| 12–23 | not started | — |
+| 11 — tenancy context (ALS + interceptor) | complete, review clean (1 fix round) | `eeb123b`, `c7696d1` |
+| 12 — refresh-token lifecycle | implemented, fix round 1 in flight | `f0b1634` |
+| 13–23 | not started | — |
 
 (`d11875c` between tasks 7 and 8 is the docs commit that added this file, ARCHITECTURE.md and PROJECT-REQUIREMENTS.md.)
 
@@ -154,7 +155,12 @@ These resolve gaps and conflicts found in the plan or environment. They are bind
 - **R25** — `TokenService.signAccessToken` embeds `purpose: 'access'` and `verifyAccessToken` requires it via a **positive** check (`!== 'access'`), so a future third token type fails safe. Without this, an MFA challenge token — issued after the password check but *before* the second factor, and signed with the same secret — verified as an access token, admitting a caller who never completed MFA to any route without an explicit `@Roles` requirement. The exported `AccessTokenClaims` stays at four fields; `purpose` is stripped from the returned object.
 - **R26** — Task 11's "super_admin sees every school" assertion is scoped `WHERE id IN (...)` to the run's own ids. Under super_admin RLS applies no filter, so accumulated rows from earlier runs break an exact assertion. The tenant-scoped tests stay deliberately unscoped: there RLS itself does the filtering, and that is the property under test.
 
-**Still to apply (tasks 12–23):**
+- **R27** — `TenantContextService` releases its `QueryRunner` on every path once `connect()` has succeeded, and only attempts `rollbackTransaction()` when a transaction actually started. Previously `connect()`/`startTransaction()` sat outside the `try/finally`, leaking a pool connection whenever `startTransaction()` threw — under exactly the load that causes it.
+- **R28** — session variables are set with bound parameters (`SELECT set_config('app.current_school_id', $1, true)`) rather than string interpolation. Values are unchanged — `'true'`/`'false'` and `''` for an absent tenant — because the RLS predicates read those exact values.
+- **R29** — the `revokeAllForUser` test seeds a **second** user and asserts their token survives. With only one user in the spec, dropping the `WHERE user_id` clause would wipe every user's sessions and the suite would still pass — and `core.refresh_tokens` has no RLS, so that test is the only control.
+- **R30** — `rotate()` claims a token with one atomic `UPDATE ... WHERE token_hash AND revoked_at IS NULL AND expires_at > now() AND device_fingerprint ... RETURNING`, proceeding only if a row came back. The prior read-then-update let two concurrent presentations of the same token both mint new pairs, defeating single-use rotation in exactly the replay scenario it exists to limit.
+
+**Still to apply (tasks 13–23):**
 
 - **R22 — Task 19:** `GET /schools` and `GET /schools/:id/users` must ship paginated (limit/offset, sane default, hard maximum). Retrofitting pagination onto a shipped endpoint is a breaking change for every client, and a school's user list reaches thousands once drivers, attendants and parents load.
 - **R23 — Task 20:** enable gzip response compression in the Nest bootstrap.

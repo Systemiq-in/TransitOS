@@ -1,0 +1,10 @@
+{
+  "name": "transitos",
+  "private": true,
+  "engines": { "node": ">=20", "pnpm": ">=9" },
+  "scripts": {
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm -r test:e2e"
+  }
+}

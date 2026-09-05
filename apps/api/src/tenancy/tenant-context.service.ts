@@ -18,22 +18,26 @@ export class TenantContextService {
   ): Promise<T> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
-      await queryRunner.query(
-        `SET LOCAL app.is_super_admin = '${claims?.isSuperAdmin ? 'true' : 'false'}'`,
-      );
-      await queryRunner.query(`SET LOCAL app.current_school_id = '${claims?.schoolId ?? ''}'`);
+      await queryRunner.startTransaction();
+      try {
+        await queryRunner.query(`SELECT set_config('app.is_super_admin', $1, true)`, [
+          claims?.isSuperAdmin ? 'true' : 'false',
+        ]);
+        await queryRunner.query(`SELECT set_config('app.current_school_id', $1, true)`, [
+          claims?.schoolId ?? '',
+        ]);
 
-      const result = await tenantContextStorage.run(queryRunner.manager, () =>
-        work(queryRunner.manager),
-      );
+        const result = await tenantContextStorage.run(queryRunner.manager, () =>
+          work(queryRunner.manager),
+        );
 
-      await queryRunner.commitTransaction();
-      return result;
-    } catch (error) {
-      await queryRunner.rollbackTransaction();
-      throw error;
+        await queryRunner.commitTransaction();
+        return result;
+      } catch (error) {
+        await queryRunner.rollbackTransaction();
+        throw error;
+      }
     } finally {
       await queryRunner.release();
     }

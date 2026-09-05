@@ -143,3 +143,46 @@ describe('TenantContextService', () => {
     expect(resultB).toEqual([{ id: schoolB }]);
   });
 });
+
+// Isolated unit test (fake DataSource/QueryRunner, no real DB) for the connection
+// lifecycle around a failed startTransaction(). Simulating a genuine dropped
+// connection against the real database is not something we can trigger
+// deterministically, so this exercises the exact control-flow property instead:
+// once connect() has succeeded, release() must run on every path, and
+// rollbackTransaction() must never be attempted for a transaction that never
+// started (calling it in that state would throw and mask the original error).
+describe('TenantContextService connection lifecycle', () => {
+  it('releases the connection and does not attempt rollback when startTransaction() throws', async () => {
+    const connect = jest.fn().mockResolvedValue(undefined);
+    const startTransaction = jest.fn().mockRejectedValue(new Error('connection dropped'));
+    const rollbackTransaction = jest.fn().mockResolvedValue(undefined);
+    const commitTransaction = jest.fn().mockResolvedValue(undefined);
+    const release = jest.fn().mockResolvedValue(undefined);
+    const query = jest.fn();
+
+    const fakeQueryRunner = {
+      connect,
+      startTransaction,
+      rollbackTransaction,
+      commitTransaction,
+      release,
+      query,
+      manager: {},
+    };
+    const fakeDataSource = {
+      createQueryRunner: () => fakeQueryRunner,
+    } as unknown as DataSource;
+
+    const failingService = new TenantContextService(fakeDataSource);
+
+    await expect(failingService.runWithTenant(null, async () => 'unused')).rejects.toThrow(
+      'connection dropped',
+    );
+
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(startTransaction).toHaveBeenCalledTimes(1);
+    expect(rollbackTransaction).not.toHaveBeenCalled();
+    expect(commitTransaction).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+});

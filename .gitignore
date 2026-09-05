@@ -1,0 +1,14 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.log
+
+# Secrets — never commit real environment values
+.env
+.env.*
+!.env.example
+
+# Agent scratch: worktrees and subagent-driven-development workspaces
+.claude/worktrees/
+.superpowers/

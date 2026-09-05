@@ -156,8 +156,17 @@ Password policy (12+ chars, upper/lower/number/symbol, common-password rejection
 enforced at the application layer (a DTO validator, not a DB constraint) at signup and
 password change.
 
-RLS: `USING (school_id = current_setting('app.current_school_id', true)::uuid OR
-current_setting('app.is_super_admin', true) = 'true')`.
+RLS: `USING (school_id = NULLIF(current_setting('app.current_school_id', true), '')::uuid
+OR current_setting('app.is_super_admin', true) = 'true')`. Tables also get `FORCE ROW
+LEVEL SECURITY` so the owning role is subject to policies too, not just non-owners.
+
+**The login carve-out**: `/auth/login` must read `core.users` by email/phone *before*
+any tenant context exists — under the policy above that read returns zero rows and
+login can never succeed. So `core.users` carries one additional, deliberately narrow
+`FOR SELECT` policy gated on a `app.auth_lookup` session flag, which only the
+credential-lookup query sets (via `SET LOCAL`, inside its own short transaction). It
+grants SELECT only — never INSERT/UPDATE/DELETE — and no other code path sets that
+flag.
 
 ### `core.password_history`
 
@@ -168,8 +177,18 @@ current_setting('app.is_super_admin', true) = 'true')`.
 | password_hash | text | Argon2id, previous hash retained to block reuse |
 | created_at | timestamptz | |
 
-Application checks the last 5 entries on password change; RLS scoped by `user_id`
-matching the authenticated caller, same rationale as `refresh_tokens` below.
+Application checks the last 5 entries on password change.
+
+**No RLS on this table** (nor on `refresh_tokens` / `mfa_credentials`), deliberately:
+all three are read during flows that run *before* a tenant or user context exists —
+`/auth/login` looks up MFA credentials before the user is authenticated, `/auth/
+refresh` looks up a token row before it knows which user presented it — and
+`password_history` is written by an admin creating *another* user, so a
+`user_id`-scoped policy would reject the legitimate write. They carry no
+tenant-readable data and are only ever reached through auth flows that filter by a
+server-derived `user_id`, so application-level scoping is the right control here.
+Cross-tenant exposure is not possible because nothing in these tables is queryable
+by school.
 
 ### `core.mfa_credentials`
 

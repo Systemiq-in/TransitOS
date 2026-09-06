@@ -144,10 +144,10 @@ The README above documents the complete setup path. To verify it works:
 This is **Sub-project 1: Foundations** — the auth/tenancy substrate every later
 sub-project builds on. This sub-project provides:
 
-- Multi-tenant identity with role-based access control (super_admin, school_admin, teacher, parent)
+- Multi-tenant identity with role-based access control (super_admin, school_admin, driver, attendant, parent)
 - MFA enrollment and verification
 - Session management (login, logout, token refresh)
-- Audit logging for all mutating operations
+- Audit logging for tenant and user creation (`school.created`, `user.created`) and for session events (`user.login`, `user.logout`, `user.logout_all`) — not yet every mutating operation; later sub-projects extend this coverage as they add endpoints
 - Database-level row-level security (RLS) enforcing tenancy boundaries
 
 See `docs/superpowers/specs/2026-09-05-foundations-design.md` for the full design

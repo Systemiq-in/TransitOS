@@ -35,8 +35,11 @@ export class SchoolsController {
 
   @Roles('super_admin')
   @Post()
-  async create(@Body() dto: CreateSchoolDto): Promise<SchoolResponseDto> {
-    const school = await this.schoolsService.create(dto.name);
+  async create(
+    @CurrentUser() user: AccessTokenClaims,
+    @Body() dto: CreateSchoolDto,
+  ): Promise<SchoolResponseDto> {
+    const school = await this.schoolsService.create(dto.name, user.sub);
     return toSchoolResponse(school);
   }
 
@@ -79,7 +82,7 @@ export class SchoolsController {
     @Body() dto: CreateSchoolUserDto,
   ): Promise<UserResponseDto> {
     this.assertCanAccessSchool(user, id);
-    const created = await this.schoolsService.createUser(id, dto);
+    const created = await this.schoolsService.createUser(id, dto, user.sub);
     return toUserResponse(created);
   }
 

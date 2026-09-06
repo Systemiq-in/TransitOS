@@ -7,7 +7,7 @@ export interface AuditEntry {
   action: string;
   entityType?: string;
   entityId?: string;
-  ipAddress?: string;
+  ipAddress?: string | null;
   metadata?: Record<string, unknown>;
 }
 

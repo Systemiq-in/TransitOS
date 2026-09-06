@@ -77,4 +77,33 @@ describe('AuditService', () => {
     );
     expect(rows).toHaveLength(1);
   });
+
+  // C1: auth.controller.ts used to fall back to the literal string 'unknown'
+  // for a missing req.ip, which is not valid `inet` input and throws inside
+  // this insert (rolling back the whole login transaction, a 500). The column
+  // is nullable — the fallback must be null, and this must succeed.
+  it('accepts a null ipAddress and succeeds', async () => {
+    const platformEntityId = randomUUID();
+
+    await tenantContextService.runWithTenant(null, () =>
+      service.record({
+        schoolId,
+        actorUserId: null,
+        action: 'user.login',
+        entityId: platformEntityId,
+        ipAddress: null,
+      }),
+    );
+
+    const rows = await tenantContextService.runWithTenant(
+      { sub: 'admin', schoolId, role: 'school_admin', isSuperAdmin: false },
+      (manager) =>
+        manager.query(
+          `SELECT ip_address FROM audit.audit_logs WHERE school_id = $1 AND entity_id = $2`,
+          [schoolId, platformEntityId],
+        ),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ip_address).toBeNull();
+  });
 });

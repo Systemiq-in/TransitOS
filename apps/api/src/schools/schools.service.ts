@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { TenantContextService } from '../tenancy/tenant-context.service';
 import { PasswordService } from '../auth/password.service';
 import { validatePasswordPolicy } from '../auth/password-policy';
+import { AuditService } from '../audit/audit.service';
 import { School } from '../entities/school.entity';
 import { User } from '../entities/user.entity';
 import { PasswordHistory } from '../entities/password-history.entity';
@@ -17,11 +18,23 @@ export class SchoolsService {
   constructor(
     private readonly tenantContextService: TenantContextService,
     private readonly passwordService: PasswordService,
+    private readonly auditService: AuditService,
   ) {}
 
-  async create(name: string): Promise<School> {
+  async create(name: string, actorUserId: string): Promise<School> {
     const manager = this.tenantContextService.getManager();
-    return manager.getRepository(School).save({ name });
+    const school = await manager.getRepository(School).save({ name });
+
+    // C2: creating a tenant is a privileged operation and must be audited.
+    await this.auditService.record({
+      schoolId: school.id,
+      actorUserId,
+      action: 'school.created',
+      entityType: 'school',
+      entityId: school.id,
+    });
+
+    return school;
   }
 
   async findById(id: string): Promise<School | null> {
@@ -39,7 +52,7 @@ export class SchoolsService {
     return { items, total };
   }
 
-  async createUser(schoolId: string, input: CreateSchoolUserDto): Promise<User> {
+  async createUser(schoolId: string, input: CreateSchoolUserDto, actorUserId: string): Promise<User> {
     const violations = validatePasswordPolicy(input.password);
     if (violations.length > 0) {
       throw new BadRequestException(`Password does not meet policy: ${violations.join(', ')}`);
@@ -58,6 +71,15 @@ export class SchoolsService {
     });
 
     await manager.getRepository(PasswordHistory).insert({ userId: user.id, passwordHash });
+
+    // C2: creating a user is a privileged operation and must be audited.
+    await this.auditService.record({
+      schoolId,
+      actorUserId,
+      action: 'user.created',
+      entityType: 'user',
+      entityId: user.id,
+    });
 
     return user;
   }

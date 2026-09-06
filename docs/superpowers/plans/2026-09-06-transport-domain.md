@@ -4816,3 +4816,855 @@ Temporarily move the stop-existence check so it runs *inside* the insert loop, o
 git add apps/api/src/transport/routes/
 git commit -m "feat: replace route stop sequences atomically in one transaction"
 ```
+
+---
+
+### Task 14: Student route assignments
+
+**Files:**
+- Create: `apps/api/src/transport/assignments/assignments.service.ts`
+- Create: `apps/api/src/transport/assignments/assignments.controller.ts`
+- Create: `apps/api/src/transport/assignments/assignments.module.ts`
+- Create: `apps/api/src/transport/assignments/dto/create-assignment.dto.ts`
+- Create: `apps/api/src/transport/assignments/dto/assignment-response.dto.ts`
+- Test: `apps/api/src/transport/assignments/assignments.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `StudentRouteAssignment`, `AssignmentDirection` (Task 5); `RouteStop` (Task 4); `Student` (Task 1); `AbacScopeService` (Task 6); `requireSchoolId` (Task 7); `TenantContextService`, `AuditService`.
+- Produces: `AssignmentsService` with `create(claims, studentId, dto)`, `list(claims, studentId)`, `end(claims, studentId, assignmentId)`; `CreateAssignmentDto`; `AssignmentResponseDto` + `toAssignmentResponse`; `AssignmentsModule`.
+
+**Three rules, each of which has burned a transport system somewhere.**
+
+1. **The stop must be on the route.** A CHECK constraint cannot span tables, so this is a service-layer join against `route_stops` (spec §6). Without it a child is assigned to a stop the bus never passes, and nobody discovers it until the bus does not stop.
+2. **At most one active assignment per student per direction.** Task 5 deliberately omitted a unique constraint, because a student legitimately has an ended assignment and a current one for the same route and direction — the date range distinguishes them. Uniqueness therefore has to be enforced here, where the dates can be read. "Active" means `effective_to IS NULL OR effective_to >= CURRENT_DATE`.
+3. **`DELETE` end-dates, it does not delete.** It sets `effective_to = CURRENT_DATE` and returns the updated row, and the audit action is `assignment.ended`. Sub-project 6 reads this history to calculate a mid-year fee adjustment, and an operator reconstructing which bus a child rode last term needs the ended rows to still be there.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/assignments/assignments.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { AbacScopeService } from '../abac/abac-scope.service';
+import { AssignmentsService } from './assignments.service';
+
+describe('AssignmentsService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: AssignmentsService;
+
+  let schoolId: string;
+  let adminId: string;
+  let parentId: string;
+  let studentId: string;
+  let otherStudentId: string;
+  let routeId: string;
+  let onRouteStopId: string;
+  let offRouteStopId: string;
+  let assignmentId: string;
+
+  const claimsFor = (role: AccessTokenClaims['role'], sub: string): AccessTokenClaims => ({
+    sub,
+    schoolId,
+    role,
+    isSuperAdmin: false,
+  });
+  const adminClaims = (): AccessTokenClaims => claimsFor('school_admin', adminId);
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  const today = (): string => new Date().toISOString().slice(0, 10);
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    service = new AssignmentsService(
+      tenantContextService,
+      new AuditService(tenantContextService),
+      new AbacScopeService(tenantContextService),
+    );
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Assignments School') RETURNING id`,
+      );
+      schoolId = school.id;
+
+      const insertUser = async (role: string, name: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+           VALUES ($1, $2, $3, 'x', $4) RETURNING id`,
+          [schoolId, role, `assignments-${role}-${randomUUID()}@example.com`, name],
+        );
+        return row.id;
+      };
+      adminId = await insertUser('school_admin', 'Admin');
+      parentId = await insertUser('parent', 'Parent');
+
+      const insertStudent = async (name: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO transport.students (school_id, admission_number, full_name, grade, status)
+           VALUES ($1, $2, $3, '4', 'active') RETURNING id`,
+          [schoolId, `ADM-${randomUUID().slice(0, 8)}`, name],
+        );
+        return row.id;
+      };
+      studentId = await insertStudent('Devika Menon');
+      otherStudentId = await insertStudent('Not My Child');
+
+      const [route] = await manager.query(
+        `INSERT INTO transport.routes (school_id, name, status) VALUES ($1, 'Route 7', 'active') RETURNING id`,
+        [schoolId],
+      );
+      routeId = route.id;
+
+      const insertStop = async (name: string, lat: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO transport.stops (school_id, name, latitude, longitude, geofence_radius_m)
+           VALUES ($1, $2, $3, '76.310000', 150) RETURNING id`,
+          [schoolId, name, lat],
+        );
+        return row.id;
+      };
+      onRouteStopId = await insertStop('On Route', '10.040000');
+      offRouteStopId = await insertStop('Off Route', '10.050000');
+
+      await manager.query(
+        `INSERT INTO transport.route_stops (school_id, route_id, stop_id, sequence, expected_offset_minutes)
+         VALUES ($1, $2, $3, 1, 0)`,
+        [schoolId, routeId, onRouteStopId],
+      );
+
+      await manager.query(
+        `INSERT INTO transport.student_guardians (school_id, student_id, guardian_user_id, relationship, is_primary, can_collect)
+         VALUES ($1, $2, $3, 'mother', true, true)`,
+        [schoolId, studentId, parentId],
+      );
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('assigns a student to a stop on the route and audits it', async () => {
+    const assignment = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), studentId, {
+        routeId,
+        stopId: onRouteStopId,
+        direction: 'both',
+        effectiveFrom: today(),
+      }),
+    );
+
+    expect(assignment.effectiveTo).toBeNull();
+    expect(assignment.direction).toBe('both');
+    assignmentId = assignment.id;
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action, entity_type FROM audit.audit_logs WHERE entity_id = $1`, [
+          assignment.id,
+        ]),
+    );
+    expect(rows).toEqual([
+      { action: 'assignment.created', entity_type: 'student_route_assignment' },
+    ]);
+  });
+
+  it('rejects a stop that is not on the route', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), otherStudentId, {
+          routeId,
+          stopId: offRouteStopId,
+          direction: 'morning',
+          effectiveFrom: today(),
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a second active assignment for the same direction', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), studentId, {
+          routeId,
+          stopId: onRouteStopId,
+          direction: 'morning',
+          effectiveFrom: today(),
+        }),
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('rejects effective_to before effective_from', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), otherStudentId, {
+          routeId,
+          stopId: onRouteStopId,
+          direction: 'afternoon',
+          effectiveFrom: '2026-09-10',
+          effectiveTo: '2026-09-01',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it("lets a parent list their own child's assignments", async () => {
+    const rows = await tenantContextService.runWithTenant(claimsFor('parent', parentId), () =>
+      service.list(claimsFor('parent', parentId), studentId),
+    );
+
+    expect(rows.map((row) => row.id)).toEqual([assignmentId]);
+  });
+
+  it("refuses a parent listing another family's child", async () => {
+    await expect(
+      tenantContextService.runWithTenant(claimsFor('parent', parentId), () =>
+        service.list(claimsFor('parent', parentId), otherStudentId),
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('end-dates an assignment instead of deleting it', async () => {
+    const ended = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.end(adminClaims(), studentId, assignmentId),
+    );
+
+    expect(ended.effectiveTo).toBe(today());
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(
+          `SELECT id, effective_to FROM transport.student_route_assignments WHERE id = $1`,
+          [assignmentId],
+        ),
+    );
+    expect(rows).toHaveLength(1);
+
+    const audits = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1 ORDER BY created_at`, [
+          assignmentId,
+        ]),
+    );
+    expect(audits.map((row: { action: string }) => row.action)).toEqual([
+      'assignment.created',
+      'assignment.ended',
+    ]);
+  });
+
+  it('allows a fresh assignment once the previous one has ended', async () => {
+    const replacement = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), studentId, {
+        routeId,
+        stopId: onRouteStopId,
+        direction: 'both',
+        effectiveFrom: today(),
+      }),
+    );
+
+    expect(replacement.id).not.toBe(assignmentId);
+  });
+
+  it('raises NotFound when ending an assignment that belongs to another student', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.end(adminClaims(), otherStudentId, assignmentId),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+"Allows a fresh assignment once the previous one has ended" is the test that keeps rule 2 from being over-applied. An implementation that checked only `(student_id, direction)` without consulting the dates would reject this and make a mid-year route change impossible — the precise scenario the date columns exist for.
+
+Note that ending an assignment sets `effective_to` to today, so it is not `>= CURRENT_DATE`-active... except it *is*: today is not before today. The active predicate is `effective_to IS NULL OR effective_to >= CURRENT_DATE`, which today's date satisfies. So the replacement in that test would collide. Resolve it by making `end` set `effective_to = CURRENT_DATE` **and** the active check exclude same-day-ended rows: the predicate for "blocks a new assignment" is `effective_to IS NULL OR effective_to > CURRENT_DATE`. A ride that ends today frees the slot from today. Use `>` in the conflict check and `>=` in `AbacScopeService` (Task 6), which asks a different question — who rides *today* — and must still include a student whose assignment ends today.
+
+That asymmetry is deliberate and easy to "tidy" into a bug. Both predicates are correct for their own question.
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- assignments.service`
+Expected: FAIL — `Cannot find module './assignments.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/assignments/dto/create-assignment.dto.ts`:
+```ts
+import { IsIn, IsISO8601, IsOptional, IsUUID } from 'class-validator';
+import { AssignmentDirection } from '../../../entities/student-route-assignment.entity';
+
+const DIRECTIONS: AssignmentDirection[] = ['morning', 'afternoon', 'both'];
+
+export class CreateAssignmentDto {
+  @IsUUID()
+  routeId: string;
+
+  @IsUUID()
+  stopId: string;
+
+  @IsIn(DIRECTIONS)
+  direction: AssignmentDirection;
+
+  @IsISO8601()
+  effectiveFrom: string;
+
+  @IsOptional()
+  @IsISO8601()
+  effectiveTo?: string;
+}
+```
+
+`apps/api/src/transport/assignments/dto/assignment-response.dto.ts`:
+```ts
+import {
+  AssignmentDirection,
+  StudentRouteAssignment,
+} from '../../../entities/student-route-assignment.entity';
+
+export interface AssignmentResponseDto {
+  id: string;
+  studentId: string;
+  routeId: string;
+  stopId: string;
+  direction: AssignmentDirection;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+}
+
+export function toAssignmentResponse(
+  assignment: StudentRouteAssignment,
+): AssignmentResponseDto {
+  return {
+    id: assignment.id,
+    studentId: assignment.studentId,
+    routeId: assignment.routeId,
+    stopId: assignment.stopId,
+    direction: assignment.direction,
+    effectiveFrom: assignment.effectiveFrom,
+    effectiveTo: assignment.effectiveTo,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/assignments/assignments.service.ts`:
+```ts
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { RouteStop } from '../../entities/route-stop.entity';
+import { StudentRouteAssignment } from '../../entities/student-route-assignment.entity';
+import { AbacScopeService } from '../abac/abac-scope.service';
+import { requireSchoolId } from '../students/students.service';
+import { CreateAssignmentDto } from './dto/create-assignment.dto';
+
+@Injectable()
+export class AssignmentsService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+    private readonly abacScopeService: AbacScopeService,
+  ) {}
+
+  async create(
+    claims: AccessTokenClaims,
+    studentId: string,
+    dto: CreateAssignmentDto,
+  ): Promise<StudentRouteAssignment> {
+    const schoolId = requireSchoolId(claims);
+    await this.abacScopeService.assertCanReadStudent(claims, studentId);
+
+    if (dto.effectiveTo && dto.effectiveTo < dto.effectiveFrom) {
+      throw new BadRequestException('effectiveTo must not be before effectiveFrom');
+    }
+
+    const manager = this.tenantContextService.getManager();
+
+    // A CHECK constraint cannot span tables (spec §6), so the stop's membership
+    // of the route is verified here. RLS keeps this lookup inside the school.
+    const onRoute = await manager.getRepository(RouteStop).findOne({
+      where: { routeId: dto.routeId, stopId: dto.stopId },
+    });
+    if (!onRoute) {
+      throw new BadRequestException('That stop is not on the given route');
+    }
+
+    // Task 5 deliberately left this out of the schema: a student legitimately
+    // has an ended assignment and a current one for the same direction, and
+    // only the dates distinguish them. `> CURRENT_DATE` rather than `>=` so an
+    // assignment ended today frees the slot from today.
+    const clash = await manager.query(
+      `SELECT id FROM transport.student_route_assignments
+        WHERE student_id = $1
+          AND direction IN ($2, 'both')
+          AND (effective_to IS NULL OR effective_to > CURRENT_DATE)
+        LIMIT 1`,
+      [studentId, dto.direction],
+    );
+    if (clash.length > 0) {
+      throw new ConflictException(
+        `That student already has an active '${dto.direction}' assignment`,
+      );
+    }
+
+    const assignment = await manager.getRepository(StudentRouteAssignment).save({
+      schoolId,
+      studentId,
+      routeId: dto.routeId,
+      stopId: dto.stopId,
+      direction: dto.direction,
+      effectiveFrom: dto.effectiveFrom,
+      effectiveTo: dto.effectiveTo ?? null,
+    });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'assignment.created',
+      entityType: 'student_route_assignment',
+      entityId: assignment.id,
+      metadata: { studentId, routeId: dto.routeId, stopId: dto.stopId },
+    });
+
+    return assignment;
+  }
+
+  async list(
+    claims: AccessTokenClaims,
+    studentId: string,
+  ): Promise<StudentRouteAssignment[]> {
+    await this.abacScopeService.assertCanReadStudent(claims, studentId);
+
+    // History included, not just the active row: an operator reconstructing
+    // which bus a child rode last term needs the ended assignments too.
+    return this.tenantContextService
+      .getManager()
+      .getRepository(StudentRouteAssignment)
+      .find({ where: { studentId }, order: { effectiveFrom: 'DESC' } });
+  }
+
+  /**
+   * Ends an assignment. Never deletes it — Sub-project 6 reads this history to
+   * calculate a mid-year fee adjustment, and the audit action is
+   * `assignment.ended` for the same reason.
+   */
+  async end(
+    claims: AccessTokenClaims,
+    studentId: string,
+    assignmentId: string,
+  ): Promise<StudentRouteAssignment> {
+    const schoolId = requireSchoolId(claims);
+    const repository = this.tenantContextService
+      .getManager()
+      .getRepository(StudentRouteAssignment);
+
+    // Scoped by student as well as id, so a mismatched pair is a 404 rather
+    // than silently ending some other child's assignment.
+    const assignment = await repository.findOne({ where: { id: assignmentId, studentId } });
+    if (!assignment) {
+      throw new NotFoundException('Assignment not found for that student');
+    }
+
+    const endedOn = new Date().toISOString().slice(0, 10);
+    const ended = await repository.save({ ...assignment, effectiveTo: endedOn });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'assignment.ended',
+      entityType: 'student_route_assignment',
+      entityId: ended.id,
+      metadata: { studentId, effectiveTo: endedOn },
+    });
+
+    return ended;
+  }
+}
+```
+
+The clash query matches `direction IN ($2, 'both')`, so an existing `both` assignment blocks a new `morning` one. It does not, however, catch a new `both` against an existing `morning` — for that the predicate would need to be symmetric. Make it symmetric: `AND (direction = $2 OR direction = 'both' OR $2 = 'both')`. Use that form in the implementation; the shorter version above is the one an implementer is likely to reach for, and it is subtly incomplete.
+
+- [ ] **Step 5: Write the controller and module**
+
+`apps/api/src/transport/assignments/assignments.controller.ts`:
+```ts
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { Roles } from '../../auth/decorators/roles.decorator';
+import { CurrentUser } from '../../auth/decorators/current-user.decorator';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { AssignmentsService } from './assignments.service';
+import { CreateAssignmentDto } from './dto/create-assignment.dto';
+import { AssignmentResponseDto, toAssignmentResponse } from './dto/assignment-response.dto';
+
+@Controller('students/:studentId/assignments')
+export class AssignmentsController {
+  constructor(private readonly assignmentsService: AssignmentsService) {}
+
+  @Roles('school_admin')
+  @Post()
+  async create(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('studentId', ParseUUIDPipe) studentId: string,
+    @Body() dto: CreateAssignmentDto,
+  ): Promise<AssignmentResponseDto> {
+    return toAssignmentResponse(await this.assignmentsService.create(user, studentId, dto));
+  }
+
+  @Roles('school_admin', 'parent', 'driver', 'attendant')
+  @Get()
+  async list(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('studentId', ParseUUIDPipe) studentId: string,
+  ): Promise<AssignmentResponseDto[]> {
+    const assignments = await this.assignmentsService.list(user, studentId);
+    return assignments.map(toAssignmentResponse);
+  }
+
+  // Returns the end-dated row rather than 204, because the caller needs to see
+  // the date it was ended on — this is not a deletion.
+  @Roles('school_admin')
+  @Delete(':assignmentId')
+  async end(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('studentId', ParseUUIDPipe) studentId: string,
+    @Param('assignmentId', ParseUUIDPipe) assignmentId: string,
+  ): Promise<AssignmentResponseDto> {
+    return toAssignmentResponse(await this.assignmentsService.end(user, studentId, assignmentId));
+  }
+}
+```
+
+The controller is mounted at `students/:studentId/assignments` rather than being folded into `StudentsController`, so `StudentsController` stays focused and the two can be reviewed apart. Nest resolves the two controllers' routes independently; there is no conflict.
+
+`apps/api/src/transport/assignments/assignments.module.ts` imports `AuthModule`, `AuditModule` and `TransportAbacModule`, declares `AssignmentsController`, and provides `AssignmentsService`.
+
+- [ ] **Step 6: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- assignments.service`
+Expected: PASS, 9 tests.
+
+- [ ] **Step 7: Prove the scoping and stop-membership tests bite**
+
+Two checks, both recorded:
+
+Remove the `assertCanReadStudent` call from `list`, re-run — "refuses a parent listing another family's child" must fail. Restore.
+
+Remove the `route_stops` lookup from `create`, re-run — "rejects a stop that is not on the route" must fail. Restore.
+
+- [ ] **Step 8: Run the full suite and commit**
+
+```bash
+git add apps/api/src/transport/assignments/
+git commit -m "feat: add student route assignments with end-dating and one-active-per-direction"
+```
+
+---
+
+### Task 15: `TransportModule` and application wiring
+
+**Files:**
+- Create: `apps/api/src/transport/transport.module.ts`
+- Modify: `apps/api/src/app.module.ts` — import `TransportModule`
+- Modify: `apps/api/src/database/data-source.ts` and `apps/api/src/database/data-source.migration.ts` — register the seven new entities if they are listed explicitly rather than globbed
+- Test: `apps/api/src/transport/transport.module.spec.ts`
+
+**Interfaces:**
+- Consumes: `StudentsModule`, `VehiclesModule`, `StopsModule`, `RoutesModule`, `AssignmentsModule`, `TransportAbacModule`.
+- Produces: `TransportModule` — a single import for `AppModule`.
+
+- [ ] **Step 1: Check how entities are registered**
+
+Run: `grep -n "entities" apps/api/src/database/data-source.ts apps/api/src/database/data-source.migration.ts`
+
+If the option is a glob (`__dirname + '/../entities/*.entity.{ts,js}'`), the seven new entities are already picked up and no change is needed. If it is an explicit array, add `Student`, `StudentGuardian`, `Vehicle`, `Stop`, `Route`, `RouteStop` and `StudentRouteAssignment` to both files. Do not guess — read the files.
+
+- [ ] **Step 2: Write the failing test**
+
+`apps/api/src/transport/transport.module.spec.ts` — a compile-time wiring test. It builds the real application module graph and asserts every transport provider resolves. This catches a missing `imports` entry, which is otherwise only discovered when a request 500s at runtime.
+
+```ts
+import { Test } from '@nestjs/testing';
+import { AppModule } from '../app.module';
+import { AbacScopeService } from './abac/abac-scope.service';
+import { StudentsService } from './students/students.service';
+import { GuardiansService } from './students/guardians.service';
+import { VehiclesService } from './vehicles/vehicles.service';
+import { StopsService } from './stops/stops.service';
+import { RoutesService } from './routes/routes.service';
+import { RouteStopsService } from './routes/route-stops.service';
+import { AssignmentsService } from './assignments/assignments.service';
+
+describe('TransportModule wiring', () => {
+  it('resolves every transport provider from the real application graph', async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+
+    for (const provider of [
+      AbacScopeService,
+      StudentsService,
+      GuardiansService,
+      VehiclesService,
+      StopsService,
+      RoutesService,
+      RouteStopsService,
+      AssignmentsService,
+    ]) {
+      expect(moduleRef.get(provider, { strict: false })).toBeDefined();
+    }
+
+    await moduleRef.close();
+  });
+});
+```
+
+`await moduleRef.close()` is not optional. Foundations' final review found a connection leak from test apps that were never closed, and per-test app creation exhausted `max_connections`. Every test that compiles a module closes it.
+
+- [ ] **Step 3: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- transport.module`
+Expected: FAIL — the transport providers are not in the graph.
+
+- [ ] **Step 4: Write the module**
+
+`apps/api/src/transport/transport.module.ts`:
+```ts
+import { Module } from '@nestjs/common';
+import { TransportAbacModule } from './abac/abac.module';
+import { StudentsModule } from './students/students.module';
+import { VehiclesModule } from './vehicles/vehicles.module';
+import { StopsModule } from './stops/stops.module';
+import { RoutesModule } from './routes/routes.module';
+import { AssignmentsModule } from './assignments/assignments.module';
+
+@Module({
+  imports: [
+    TransportAbacModule,
+    StudentsModule,
+    VehiclesModule,
+    StopsModule,
+    RoutesModule,
+    AssignmentsModule,
+  ],
+})
+export class TransportModule {}
+```
+
+- [ ] **Step 5: Import it into the application**
+
+In `apps/api/src/app.module.ts`, add `TransportModule` to the `imports` array after `SchoolsModule`. Change nothing else — the guard, interceptor and filter ordering in `providers` is load-bearing (rate-limit, then authenticate, then authorize; the tenancy transaction wrapping the response envelope), and it already covers the new controllers.
+
+- [ ] **Step 6: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- transport.module`
+Expected: PASS, 1 test. Then the full unit suite twice, plus `pnpm --filter @transitos/api lint` and `pnpm --filter @transitos/api build`, all clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/api/src/transport/transport.module.ts apps/api/src/app.module.ts apps/api/src/database/
+git commit -m "feat: wire transport module into the application"
+```
+
+---
+
+### Task 16: End-to-end proof and documentation
+
+**Files:**
+- Create: `apps/api/test/transport-abac.e2e-spec.ts`
+- Create: `apps/api/test/transport-lifecycle.e2e-spec.ts`
+- Modify: `README.md` — a transport API section
+- Modify: `docs/DECISIONS.md` — record anything ruled during 2a
+
+**Interfaces:**
+- Consumes: `createTestApp()` from `test/helpers/app`; `TenantContextService`; `PasswordService`; the HTTP surface built in Tasks 8–15.
+- Produces: no source, but the sub-project's acceptance evidence.
+
+**Why both service tests and these.** Every restriction so far was proved at the service layer, where the claims object is constructed by the test. These prove the same restrictions **over HTTP**, where the claims come from a real login and a real JWT, and where the guards, the tenancy interceptor, the response envelope and the exception filter all sit in the path. Spec §8 requires the parent case specifically to be verified this way — a service-layer proof cannot show that the wiring delivers it.
+
+- [ ] **Step 1: Write the ABAC e2e test**
+
+`apps/api/test/transport-abac.e2e-spec.ts`. Seed, through `runWithTenant` as super_admin: one school; a `school_admin`, a `parent` and a `driver`, all with the password `Correct-Horse9!` hashed by `PasswordService`; two students; a `student_guardians` row linking the parent to the **first** student only; a route with `default_driver_user_id` set to the driver, one stop, one `route_stops` row, and an active assignment putting the first student on it. Every email carries a `randomUUID()`.
+
+Then, logging in over HTTP for each role and using the returned `accessToken`:
+
+```ts
+  it('shows a parent only their own child', async () => {
+    const token = await login(parentEmail);
+
+    const list = await request(app.getHttpServer())
+      .get('/students')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(list.body.data.items).toHaveLength(1);
+    expect(list.body.data.items[0].id).toBe(ownChildId);
+
+    await request(app.getHttpServer())
+      .get(`/students/${otherChildId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(403);
+  });
+
+  it('shows a driver the students on their route and no guardian details', async () => {
+    const token = await login(driverEmail);
+
+    const list = await request(app.getHttpServer())
+      .get('/students')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(list.body.data.items.map((student: { id: string }) => student.id)).toEqual([ownChildId]);
+    // The student response is an allow-list with nowhere to put contact details.
+    expect(JSON.stringify(list.body.data.items)).not.toContain(parentEmail);
+  });
+
+  it('refuses a parent the write endpoints entirely', async () => {
+    const token = await login(parentEmail);
+
+    await request(app.getHttpServer())
+      .post('/students')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ admissionNumber: 'ADM-X', fullName: 'Injected', grade: '1' })
+      .expect(403);
+  });
+
+  it('refuses an unauthenticated caller', async () => {
+    await request(app.getHttpServer()).get('/students').expect(401);
+  });
+```
+
+`login` is a local helper posting to `/auth/login` and returning `body.data.accessToken`.
+
+Assert on `body.data` throughout — `ResponseInterceptor` wraps every response in `{ success, data }`, and a test asserting on `body.items` would pass vacuously against `undefined` in some matchers.
+
+- [ ] **Step 2: Write the lifecycle e2e test**
+
+`apps/api/test/transport-lifecycle.e2e-spec.ts` walks spec §8's first acceptance criterion as one `school_admin` session, each step over HTTP:
+
+1. `POST /students` → 201, capture id
+2. `POST /students/:id/guardians` → 201
+3. `POST /vehicles` → 201
+4. `POST /stops` twice → 201, capture both ids
+5. `POST /routes` with the vehicle as default → 201
+6. `PUT /routes/:id/stops` with both stops in order → 200, `sequence` 1 and 2
+7. `GET /routes/:id/stops` → 200, same order
+8. `POST /students/:id/assignments` on the first stop → 201
+9. `GET /students/:id/assignments` → 200, one row, `effectiveTo` null
+10. `DELETE /students/:id/assignments/:assignmentId` → 200, `effectiveTo` is today
+11. `GET /students/:id/assignments` → 200, **still one row** — the end-date did not delete it
+
+Then one query, as super_admin through `runWithTenant`, asserting the audit trail for the whole walk:
+
+```ts
+  it('audited every mutation in the walkthrough', async () => {
+    const rows = await tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      async (manager) =>
+        manager.query(
+          `SELECT action FROM audit.audit_logs WHERE school_id = $1 ORDER BY created_at`,
+          [schoolId],
+        ),
+    );
+
+    expect(rows.map((row: { action: string }) => row.action)).toEqual([
+      'student.created',
+      'guardian.linked',
+      'vehicle.created',
+      'stop.created',
+      'stop.created',
+      'route.created',
+      'route.stops_replaced',
+      'assignment.created',
+      'assignment.ended',
+    ]);
+  });
+```
+
+That single assertion is the acceptance evidence for spec §5 — it shows not only that auditing happens but that it happens for *every* mutation, in order, with none missing. If the list does not match exactly, find the missing `AuditService.record` call rather than relaxing the assertion.
+
+Also add a 400 case, proving the domain error reaches the client as a 400 rather than a 500:
+
+```ts
+  it('rejects an assignment to a stop that is not on the route', async () => {
+    await request(app.getHttpServer())
+      .post(`/students/${studentId}/assignments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ routeId, stopId: unusedStopId, direction: 'morning', effectiveFrom: today })
+      .expect(400);
+  });
+```
+
+- [ ] **Step 3: Run the e2e suite**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test:e2e`
+Expected: PASS — the two new files plus the two from Foundations.
+
+Both new files must close their app in `afterAll`.
+
+- [ ] **Step 4: Update the README**
+
+Add a "Transport API" section documenting the endpoint table from spec §4, and three points a reader will otherwise get wrong:
+
+- Reads are role-gated *and* row-scoped. `GET /students` returns a different set to a parent, a driver and a school_admin, and that narrowing lives in `AbacScopeService`, not in RLS.
+- `DELETE /students/:id/assignments/:assignmentId` end-dates; it does not delete. It returns the updated row.
+- `PUT /routes/:id/stops` replaces the whole ordered list. Sequence numbers come from array position; sending your own is not supported.
+
+Keep the existing README structure and voice; this is a new section, not a rewrite.
+
+- [ ] **Step 5: Update `docs/DECISIONS.md`**
+
+Append any ruling made while implementing 2a, in the file's existing format with its cost-if-wrong column. At minimum:
+
+- The two active-assignment predicates differ on purpose (`>` for the conflict check, `>=` for `AbacScopeService`), because they answer different questions. Cost if wrong: either a student who changed routes today vanishes from their new driver's list, or a route change is impossible on the day it happens.
+- Out-of-scope routes return 404 while out-of-scope students return 403. Cost if wrong: a 403 on routes tells a driver which route ids exist in the school.
+- Guardian links are hard-deleted while students and assignments are not. Cost if wrong: either an unrecoverable history gap, or unbounded growth of revoked links nothing reads.
+
+- [ ] **Step 6: Full verification**
+
+All four, in order, from the repository root with the environment loaded:
+
+```bash
+set -a && . ./.env && set +a
+pnpm --filter @transitos/api lint
+pnpm --filter @transitos/api build
+pnpm --filter @transitos/api test
+pnpm --filter @transitos/api test        # twice — the database persists between runs
+pnpm --filter @transitos/api test:e2e
+```
+
+Report the actual counts. A suite that passes once and fails on the second run has fixture collision, not flakiness, and must be fixed rather than re-run.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/api/test/ README.md docs/DECISIONS.md
+git commit -m "test: prove transport ABAC and lifecycle over HTTP; document the API"
+```

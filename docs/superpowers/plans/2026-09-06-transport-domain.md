@@ -515,3 +515,301 @@ git add apps/api/src/database/migrations/1757030700000-CreateStudentGuardians.ts
         apps/api/src/entities/student-guardian.entity.ts
 git commit -m "feat: add student_guardians link table with tenant RLS"
 ```
+
+---
+
+### Task 3: `transport.vehicles` and `transport.stops`
+
+**Files:**
+- Create: `apps/api/src/database/migrations/1757030800000-CreateVehiclesAndStops.ts`
+- Create: `apps/api/src/entities/vehicle.entity.ts`, `apps/api/src/entities/stop.entity.ts`
+- Test: `apps/api/src/database/migrations/create-vehicles-and-stops.spec.ts`
+
+**Interfaces:**
+- Consumes: `core.schools`, `validateEnv`.
+- Produces: `transport.vehicles`, `transport.stops`; entities `Vehicle` (`id, schoolId, registrationNumber, capacity, ownershipType, operatorName, status, createdAt, updatedAt`; `VehicleOwnership = 'school_owned' | 'contracted' | 'other'`, `VehicleStatus = 'active' | 'maintenance' | 'retired'`) and `Stop` (`id, schoolId, name, latitude, longitude, geofenceRadiusM, specialInstructions, createdAt, updatedAt`).
+
+Both tables ship together because each is a standalone lookup with no dependency on the other; splitting them would create two near-identical review surfaces.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/database/migrations/create-vehicles-and-stops.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../data-source.migration';
+import { appDataSourceOptions } from '../data-source';
+
+describe('CreateVehiclesAndStops migration', () => {
+  let migrator: DataSource;
+  let app: DataSource;
+  let schoolA: string;
+
+  const asSuperAdmin = async <T>(fn: (q: (sql: string, p?: unknown[]) => Promise<unknown>) => Promise<T>): Promise<T> => {
+    const runner = app.createQueryRunner();
+    await runner.startTransaction();
+    await runner.query(`SELECT set_config('app.is_super_admin', $1, true)`, ['true']);
+    try {
+      const result = await fn((sql, p) => runner.query(sql, p));
+      await runner.commitTransaction();
+      return result;
+    } catch (error) {
+      await runner.rollbackTransaction();
+      throw error;
+    } finally {
+      await runner.release();
+    }
+  };
+
+  beforeAll(async () => {
+    migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    app = await new DataSource(appDataSourceOptions).initialize();
+    await asSuperAdmin(async (q) => {
+      const s = (await q(`INSERT INTO core.schools (name) VALUES ('V-${randomUUID()}') RETURNING id`)) as { id: string }[];
+      schoolA = s[0].id;
+    });
+  });
+
+  afterAll(async () => {
+    await app?.destroy();
+    await migrator?.destroy();
+  });
+
+  it('stores a contracted vehicle with its operator', async () => {
+    const rows = (await asSuperAdmin(async (q) =>
+      q(
+        `INSERT INTO transport.vehicles (school_id, registration_number, capacity, ownership_type, operator_name)
+         VALUES ($1, $2, 36, 'contracted', 'Kerala Travels') RETURNING ownership_type, operator_name`,
+        [schoolA, `KL-07-${randomUUID().slice(0, 6)}`],
+      ),
+    )) as { ownership_type: string; operator_name: string }[];
+    expect(rows[0]).toEqual({ ownership_type: 'contracted', operator_name: 'Kerala Travels' });
+  });
+
+  it('rejects an unknown ownership type', async () => {
+    await expect(
+      asSuperAdmin(async (q) =>
+        q(
+          `INSERT INTO transport.vehicles (school_id, registration_number, capacity, ownership_type)
+           VALUES ($1, $2, 36, 'leased')`,
+          [schoolA, `KL-08-${randomUUID().slice(0, 6)}`],
+        ),
+      ),
+    ).rejects.toThrow(/vehicles_ownership_check/i);
+  });
+
+  it('stores a stop with coordinates and a default geofence radius', async () => {
+    const rows = (await asSuperAdmin(async (q) =>
+      q(
+        `INSERT INTO transport.stops (school_id, name, latitude, longitude)
+         VALUES ($1, $2, 10.026400, 76.308100) RETURNING latitude, longitude, geofence_radius_m`,
+        [schoolA, `Edappally-${randomUUID().slice(0, 6)}`],
+      ),
+    )) as { latitude: string; longitude: string; geofence_radius_m: number }[];
+    expect(Number(rows[0].latitude)).toBeCloseTo(10.0264, 4);
+    expect(Number(rows[0].longitude)).toBeCloseTo(76.3081, 4);
+    expect(rows[0].geofence_radius_m).toBe(150);
+  });
+
+  it('rejects a transposed coordinate pair', async () => {
+    await expect(
+      asSuperAdmin(async (q) =>
+        q(
+          `INSERT INTO transport.stops (school_id, name, latitude, longitude)
+           VALUES ($1, $2, 76.308100, 10.026400)`,
+          [schoolA, `Bad-${randomUUID().slice(0, 6)}`],
+        ),
+      ),
+    ).rejects.toThrow(/stops_latitude_check/i);
+  });
+
+  it('denies access without erroring when the tenant context is an empty string', async () => {
+    const runner = app.createQueryRunner();
+    await runner.startTransaction();
+    await runner.query(`SELECT set_config('app.is_super_admin', $1, true)`, ['false']);
+    await runner.query(`SELECT set_config('app.current_school_id', $1, true)`, ['']);
+    const vehicles = await runner.query(`SELECT id FROM transport.vehicles`);
+    const stops = await runner.query(`SELECT id FROM transport.stops`);
+    await runner.rollbackTransaction();
+    await runner.release();
+
+    expect(vehicles).toEqual([]);
+    expect(stops).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- create-vehicles-and-stops`
+Expected: FAIL — `relation "transport.vehicles" does not exist`.
+
+- [ ] **Step 3: Write the migration**
+
+`apps/api/src/database/migrations/1757030800000-CreateVehiclesAndStops.ts`:
+```ts
+import { MigrationInterface, QueryRunner } from 'typeorm';
+import { validateEnv } from '../../config/env.schema';
+
+export class CreateVehiclesAndStops1757030800000 implements MigrationInterface {
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    const appRole = validateEnv(process.env).APP_DB_ROLE;
+
+    await queryRunner.query(`
+      CREATE TABLE transport.vehicles (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        school_id uuid NOT NULL REFERENCES core.schools(id),
+        registration_number text NOT NULL,
+        capacity integer NOT NULL,
+        ownership_type text NOT NULL DEFAULT 'school_owned',
+        operator_name text,
+        status text NOT NULL DEFAULT 'active',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT vehicles_ownership_check
+          CHECK (ownership_type IN ('school_owned', 'contracted', 'other')),
+        CONSTRAINT vehicles_status_check CHECK (status IN ('active', 'maintenance', 'retired')),
+        CONSTRAINT vehicles_capacity_check CHECK (capacity > 0),
+        CONSTRAINT vehicles_registration_unique UNIQUE (school_id, registration_number)
+      )
+    `);
+
+    await queryRunner.query(`
+      CREATE TABLE transport.stops (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        school_id uuid NOT NULL REFERENCES core.schools(id),
+        name text NOT NULL,
+        latitude numeric(9,6) NOT NULL,
+        longitude numeric(9,6) NOT NULL,
+        geofence_radius_m integer NOT NULL DEFAULT 150,
+        special_instructions text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT stops_latitude_check CHECK (latitude BETWEEN -90 AND 90),
+        CONSTRAINT stops_longitude_check CHECK (longitude BETWEEN -180 AND 180),
+        CONSTRAINT stops_geofence_check CHECK (geofence_radius_m > 0)
+      )
+    `);
+
+    for (const table of ['vehicles', 'stops']) {
+      await queryRunner.query(`CREATE INDEX ${table}_school_id_idx ON transport.${table} (school_id)`);
+      await queryRunner.query(`ALTER TABLE transport.${table} ENABLE ROW LEVEL SECURITY`);
+      await queryRunner.query(`ALTER TABLE transport.${table} FORCE ROW LEVEL SECURITY`);
+      await queryRunner.query(`
+        CREATE POLICY ${table}_tenant_all ON transport.${table}
+          FOR ALL
+          USING (
+            current_setting('app.is_super_admin', true) = 'true'
+            OR school_id = NULLIF(current_setting('app.current_school_id', true), '')::uuid
+          )
+          WITH CHECK (
+            current_setting('app.is_super_admin', true) = 'true'
+            OR school_id = NULLIF(current_setting('app.current_school_id', true), '')::uuid
+          )
+      `);
+      await queryRunner.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON transport.${table} TO ${appRole}`);
+    }
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`DROP TABLE IF EXISTS transport.stops`);
+    await queryRunner.query(`DROP TABLE IF EXISTS transport.vehicles`);
+  }
+}
+```
+
+The loop is safe: `table` iterates a hardcoded literal array, never a caller-supplied value.
+
+The latitude and longitude CHECKs exist because a transposed pair — 76, 10 instead of 10, 76 — is the most common coordinate entry mistake, and without the constraint it would sit undetected until Sub-project 3 tried to route a bus into the Arabian Sea.
+
+- [ ] **Step 4: Write the entities**
+
+`apps/api/src/entities/vehicle.entity.ts`:
+```ts
+import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
+
+export type VehicleOwnership = 'school_owned' | 'contracted' | 'other';
+export type VehicleStatus = 'active' | 'maintenance' | 'retired';
+
+@Entity({ schema: 'transport', name: 'vehicles' })
+export class Vehicle {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'school_id', type: 'uuid' })
+  schoolId: string;
+
+  @Column({ name: 'registration_number', type: 'text' })
+  registrationNumber: string;
+
+  @Column({ type: 'integer' })
+  capacity: number;
+
+  @Column({ name: 'ownership_type', type: 'text' })
+  ownershipType: VehicleOwnership;
+
+  @Column({ name: 'operator_name', type: 'text', nullable: true })
+  operatorName: string | null;
+
+  @Column({ type: 'text' })
+  status: VehicleStatus;
+
+  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
+  updatedAt: Date;
+}
+```
+
+`apps/api/src/entities/stop.entity.ts`:
+```ts
+import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
+
+@Entity({ schema: 'transport', name: 'stops' })
+export class Stop {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'school_id', type: 'uuid' })
+  schoolId: string;
+
+  @Column({ type: 'text' })
+  name: string;
+
+  // numeric(9,6) is returned by pg as a string to preserve precision;
+  // the response DTO converts it for the wire.
+  @Column({ type: 'numeric', precision: 9, scale: 6 })
+  latitude: string;
+
+  @Column({ type: 'numeric', precision: 9, scale: 6 })
+  longitude: string;
+
+  @Column({ name: 'geofence_radius_m', type: 'integer' })
+  geofenceRadiusM: number;
+
+  @Column({ name: 'special_instructions', type: 'text', nullable: true })
+  specialInstructions: string | null;
+
+  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
+  updatedAt: Date;
+}
+```
+
+- [ ] **Step 5: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- create-vehicles-and-stops`
+Expected: PASS, 5 tests. Then the full suite twice, green both times.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add apps/api/src/database/migrations/1757030800000-CreateVehiclesAndStops.ts \
+        apps/api/src/database/migrations/create-vehicles-and-stops.spec.ts \
+        apps/api/src/entities/vehicle.entity.ts apps/api/src/entities/stop.entity.ts
+git commit -m "feat: add vehicles and stops tables with tenant RLS"
+```

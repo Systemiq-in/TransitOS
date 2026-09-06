@@ -7,6 +7,7 @@ describe('CreateVehiclesAndStops migration', () => {
   let migrator: DataSource;
   let app: DataSource;
   let schoolA: string;
+  let schoolB: string;
 
   const asSuperAdmin = async <T>(fn: (q: (sql: string, p?: unknown[]) => Promise<unknown>) => Promise<T>): Promise<T> => {
     const runner = app.createQueryRunner();
@@ -45,6 +46,8 @@ describe('CreateVehiclesAndStops migration', () => {
     await asSuperAdmin(async (q) => {
       const s = (await q(`INSERT INTO core.schools (name) VALUES ('V-${randomUUID()}') RETURNING id`)) as { id: string }[];
       schoolA = s[0].id;
+      const b = (await q(`INSERT INTO core.schools (name) VALUES ('W-${randomUUID()}') RETURNING id`)) as { id: string }[];
+      schoolB = b[0].id;
     });
   });
 
@@ -130,6 +133,36 @@ describe('CreateVehiclesAndStops migration', () => {
 
     expect(vehicles).toHaveLength(1);
     expect(stops).toHaveLength(1);
+  });
+
+  it('hides one school vehicles from another school session', async () => {
+    const registration = `KL-10-${randomUUID().slice(0, 6)}`;
+    await asSuperAdmin(async (q) => {
+      await q(
+        `INSERT INTO transport.vehicles (school_id, registration_number, capacity) VALUES ($1, $2, 40)`,
+        [schoolA, registration],
+      );
+    });
+
+    const rows = await asTenant(
+      schoolB,
+      `SELECT id FROM transport.vehicles WHERE registration_number = $1`,
+      [registration],
+    );
+    expect(rows).toEqual([]);
+  });
+
+  it('hides one school stops from another school session', async () => {
+    const stopName = `Aluva-${randomUUID().slice(0, 6)}`;
+    await asSuperAdmin(async (q) => {
+      await q(
+        `INSERT INTO transport.stops (school_id, name, latitude, longitude) VALUES ($1, $2, 10.1075, 76.3516)`,
+        [schoolA, stopName],
+      );
+    });
+
+    const rows = await asTenant(schoolB, `SELECT id FROM transport.stops WHERE name = $1`, [stopName]);
+    expect(rows).toEqual([]);
   });
 
   it('denies access without erroring when the tenant context is an empty string', async () => {

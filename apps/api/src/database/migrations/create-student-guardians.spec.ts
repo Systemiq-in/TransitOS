@@ -7,6 +7,7 @@ describe('CreateStudentGuardians migration', () => {
   let migrator: DataSource;
   let app: DataSource;
   let schoolA: string;
+  let schoolB: string;
   let studentA: string;
   let parentA: string;
 
@@ -47,6 +48,8 @@ describe('CreateStudentGuardians migration', () => {
     await asSuperAdmin(async (q) => {
       const s = (await q(`INSERT INTO core.schools (name) VALUES ('G-${randomUUID()}') RETURNING id`)) as { id: string }[];
       schoolA = s[0].id;
+      const b = (await q(`INSERT INTO core.schools (name) VALUES ('H-${randomUUID()}') RETURNING id`)) as { id: string }[];
+      schoolB = b[0].id;
       const st = (await q(
         `INSERT INTO transport.students (school_id, admission_number, full_name, grade)
          VALUES ($1, $2, 'Child', '5') RETURNING id`,
@@ -97,6 +100,32 @@ describe('CreateStudentGuardians migration', () => {
       [studentA, parentA],
     );
     expect(rows).toHaveLength(1);
+  });
+
+  it('hides one school student_guardians from another school session', async () => {
+    const admission = `ISO-${randomUUID()}`;
+    let linkId = '';
+    await asSuperAdmin(async (q) => {
+      const st = (await q(
+        `INSERT INTO transport.students (school_id, admission_number, full_name, grade)
+         VALUES ($1, $2, 'Iso Child', '5') RETURNING id`,
+        [schoolA, admission],
+      )) as { id: string }[];
+      const u = (await q(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'parent', $2, 'x', 'Iso Parent') RETURNING id`,
+        [schoolA, `iso-${randomUUID()}@example.com`],
+      )) as { id: string }[];
+      const link = (await q(
+        `INSERT INTO transport.student_guardians (school_id, student_id, guardian_user_id, relationship)
+         VALUES ($1, $2, $3, 'guardian') RETURNING id`,
+        [schoolA, st[0].id, u[0].id],
+      )) as { id: string }[];
+      linkId = link[0].id;
+    });
+
+    const rows = await asTenant(schoolB, `SELECT id FROM transport.student_guardians WHERE id = $1`, [linkId]);
+    expect(rows).toEqual([]);
   });
 
   it('denies access without erroring when the tenant context is an empty string', async () => {

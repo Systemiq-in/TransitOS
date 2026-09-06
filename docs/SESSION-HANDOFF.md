@@ -1,196 +1,222 @@
 # TransitOS — Session Handoff & Recovery
 
-**Purpose:** everything a fresh session (or a different person) needs to resume this build without re-deriving anything. If the assistant's memory is wrong and this document disagrees with it, **this document and `git log` win.**
+**Purpose:** everything a fresh session (or a different person) needs to resume this
+build without re-deriving anything. If the assistant's memory disagrees with this
+document, **this document and `git log` win.**
 
-Last updated: 2026-09-05, after Task 9 implementation (Task 9 review in flight).
+Last updated: 2026-09-06, after Sub-project 2a Tasks 1–3 passed review. Task 4 is next.
 
 ---
 
-## 1. Where the work lives
+## 1. Where things stand, in one paragraph
+
+Sub-project 1 (**Foundations**) is shipped and merged to `main`: identity, JWT auth,
+multi-tenancy enforced by Postgres Row-Level Security, and audit logging. Sub-project
+2a (**transport domain**) has a finished 16-task implementation plan on `main`, and
+**tasks 1–3 of 16 are implemented, reviewed and green** on the branch
+`feat/transport-domain`. Execution is mid-flight. The next action is dispatching Task 4.
+
+---
+
+## 2. Resume in three commands
+
+```bash
+cd ~/projects/TransitOS/.worktrees/transport-domain   # work happens HERE, not the main checkout
+cat .superpowers/sdd/2026-09-06-transport-domain/progress.md   # the ledger — read first
+git log --oneline 3b4d4c1..HEAD
+```
+
+The ledger's last section is headed `## NEXT:` and names the task to dispatch, its
+BASE commit, and the four things that must be carried into that dispatch.
+
+The ledger is **gitignored scratch and can vanish** (`git clean -fdx` destroys it). The
+durable record is this file, the spec, the plan, and the git history.
+
+---
+
+## 3. Where the work lives
 
 | Thing | Location |
 |---|---|
-| Main repo | `/home/mhdramzy/projects/TransitOS` (branch `main` — docs only, no app code) |
-| Active worktree | `/home/mhdramzy/projects/TransitOS/.worktrees/foundations` (branch `foundations`) |
-| Spec being implemented | `docs/superpowers/specs/2026-09-05-foundations-design.md` |
-| Platform-wide standards | `docs/superpowers/specs/engineering-standards.md` |
-| Implementation plan (23 tasks) | `docs/superpowers/plans/2026-09-05-foundations.md` |
-| Working ledger | `.superpowers/sdd/2026-09-05-foundations/progress.md` — **gitignored scratch, can vanish** |
-| Task briefs & reports | `.superpowers/sdd/2026-09-05-foundations/task-N-{brief,report}.md` — also gitignored |
+| Main repo | `~/projects/TransitOS`, branch `main` @ `3b4d4c1` — Foundations code + all docs. Clean. |
+| Active worktree | `~/projects/TransitOS/.worktrees/transport-domain`, branch `feat/transport-domain`. Clean, 5 commits ahead. |
+| **Spec (binding authority)** | `docs/superpowers/specs/2026-09-06-transport-domain-design.md` |
+| Plan (16 tasks, 5,682 lines) | `docs/superpowers/plans/2026-09-06-transport-domain.md` |
+| Platform-wide standards | `docs/superpowers/specs/engineering-standards.md` — Part I security/privacy, Part II performance, each control tagged by owning sub-project |
+| Foundations spec & plan | `docs/superpowers/specs/2026-09-05-foundations-design.md`, `docs/superpowers/plans/2026-09-05-foundations.md` |
+| Rulings from Foundations | `docs/DECISIONS.md` — 38 entries, each with cost-if-wrong |
+| SDD workspace (gitignored) | `.worktrees/transport-domain/.superpowers/sdd/2026-09-06-transport-domain/` — ledger, briefs, reports, review diffs |
 
-**All application code is on the `foundations` branch, not `main`.** `main` holds only `idea.md`, the specs, the plan, and `.gitignore`.
-
-Because the ledger is gitignored, the durable record of decisions is: this file, the specs, the plan, and the git history. The ledger is a convenience, not the source of truth.
+The plan argues *from* the spec. Where they conflict, the spec wins.
 
 ---
 
-## 2. Local environment (must exist before running anything)
+## 4. Commits on `feat/transport-domain`
 
-**PostgreSQL runs in a container, NOT via docker-compose.** The only Compose CLI installed on this machine is v1.29.2, which cannot talk to Docker 29.1.3 (`Not supported URL scheme http+docker`). The committed `docker-compose.yml` is correct for anyone with Compose V2 — it is simply not usable here.
-
-Recreate the database container if it is gone:
-
-```bash
-docker run -d --name transitos-pg --restart unless-stopped \
-  -e POSTGRES_USER=transitos_migrator \
-  -e POSTGRES_PASSWORD=devpassword \
-  -e POSTGRES_DB=transitos \
-  -p 55432:5432 postgres:16
-
-# then create the test database
-PGPASSWORD=devpassword psql -h 127.0.0.1 -p 55432 -U transitos_migrator -d transitos \
-  -c 'CREATE DATABASE transitos_test'
+```
+5bb5eec test: add cross-tenant isolation tests for student_guardians, vehicles, stops
+6639f2d feat: add vehicles and stops tables with tenant RLS
+72c1092 feat: add student_guardians link table with tenant RLS
+051cc49 fix: tighten transport.students grant and RLS test coverage
+cf12839 feat: add transport schema and students table with tenant RLS
 ```
 
-Port **55432**, not 5432 — this machine already runs its own PostgreSQL on 5432 and it must not be disturbed.
+Full API suite: **180/180 passing, twice consecutively.** Working tree clean.
 
-`.env` at the worktree root is gitignored and holds working values. If it is missing, recreate it (secrets can be any fresh random values):
+---
+
+## 5. Task status
+
+| Tasks | State |
+|---|---|
+| 1 — `transport` schema + `students` | complete, review clean |
+| 2 — `student_guardians` | complete, review clean |
+| 3 — `vehicles` + `stops` | complete, review clean |
+| **4 — `routes` + `route_stops`** | **NEXT.** Brief pre-extracted. BASE = `5bb5eec` |
+| 5 — `student_route_assignments` | brief pre-extracted |
+| 6 — `AbacScopeService` | brief pre-extracted. **The security core of 2a** |
+| 7–9 — students & guardians services + HTTP | not started |
+| 10 — vehicles · 11 — stops | not started |
+| 12–13 — routes + atomic stop replacement | not started |
+| 14 — assignments · 15 — module wiring · 16 — e2e + README | not started |
+
+Briefs for 2–6 already exist in the workspace. For later tasks:
 
 ```bash
-NODE_ENV=test
-PORT=3000
-DATABASE_URL=postgres://transitos_app:apppassword@127.0.0.1:55432/transitos_test
-DATABASE_MIGRATION_URL=postgres://transitos_migrator:devpassword@127.0.0.1:55432/transitos_test
-APP_DB_ROLE=transitos_app
-APP_DB_PASSWORD=apppassword
-JWT_SECRET=<openssl rand -base64 48>
-MFA_ENCRYPTION_KEY=<openssl rand -hex 32>
-ACCESS_TOKEN_TTL_SECONDS=900
-REFRESH_TOKEN_TTL_SECONDS=604800
-MFA_CHALLENGE_TTL_SECONDS=300
+SK=~/.claude/plugins/cache/claude-plugins-official/superpowers/6.3.0/skills/subagent-driven-development
+$SK/scripts/task-brief      docs/superpowers/plans/2026-09-06-transport-domain.md <N>
+$SK/scripts/review-package  docs/superpowers/plans/2026-09-06-transport-domain.md <BASE> HEAD
 ```
 
-Nothing wires up dotenv — tests read `process.env` directly, so **export before running anything**:
+---
+
+## 6. Process being followed
+
+`superpowers:subagent-driven-development`. Per task: extract the brief → dispatch a
+fresh implementer (hand it the **brief path**, never the whole plan) → generate a
+review package → dispatch a task reviewer for **two** verdicts, spec compliance *and*
+quality → fix loop, max 5 rounds, resuming the same implementer for rounds 1–3 →
+scoped re-review → ledger the completion. After all 16: a whole-branch final review on
+the most capable model, then `superpowers:finishing-a-development-branch`.
+
+Rules that matter: never run two implementers in parallel; never fix findings in the
+controller session (it skips review); every ruling goes in the ledger.
+
+---
+
+## 7. Rulings made this session
+
+Full reasoning is in the ledger. Reverse any you disagree with.
+
+1. **Task 13 keeps its direct `Stop` repository lookup** instead of calling
+   `StopsService` — it validates a whole list in one batched `In(stopIds)` query.
+   *Cost if wrong: one unused module export.*
+2. **Task 14 end-dates with SQL `CURRENT_DATE`, not a Node-computed date.** Postgres
+   runs `Etc/UTC`, Node runs `Asia/Calcutta`; they agree today only by luck.
+   *Cost if wrong: a route change between 00:00–05:30 IST lands on the wrong day.*
+3. **`DELETE` is granted only where the domain genuinely deletes rows** —
+   `student_guardians` and `route_stops`. Students, vehicles, stops, routes and
+   assignments get `SELECT, INSERT, UPDATE`, which makes "never hard-deleted" a
+   database guarantee instead of service-layer discipline.
+   *Cost if wrong: a future delete needs a migration to re-grant.*
+4. **Every table's spec needs a positive-path RLS test** proving a correctly-scoped
+   tenant can read its own row. *Cost if wrong: none, added coverage.*
+5. **Every table's spec needs a cross-tenant denial test** using a second real school.
+   *Cost if wrong: none, added coverage.*
+6. **Tasks 2+3 and 4+5 are batched** into one implementer dispatch each — same shape,
+   complete code in the briefs, disjoint files. *Cost if wrong: a batched review
+   spreads attention; mitigated by a per-table review lens.*
+7. **A Minor finding against the implementer was withdrawn** — the reviewer misread
+   the brief, and the implementer correctly refused to write a falsehood into its
+   report. *Cost if wrong: none.*
+8. **Task 3's transposed-coordinate fixture was corrected** by the implementer (see
+   below). *Cost if wrong: none.*
+
+---
+
+## 8. Three defects the review layer found in the plan itself
+
+All three are the same failure mode — **tests that read like protection but cannot
+fail** — and the same mode may lurk in the twelve unbuilt tasks:
+
+- Task 1's four RLS tests would all have passed under a `USING (false)` policy. None
+  asserted that a tenant could read its *own* row.
+- Tasks 2–5's briefs omitted the cross-tenant isolation test Task 1 happened to have.
+  A policy reading `... OR current_setting('app.current_school_id', true) <> ''` —
+  granting access on any non-empty context without ever comparing `school_id` — would
+  have passed every test across three tables.
+- Task 3's "rejects a transposed coordinate pair" test used real Kerala coordinates
+  (lat ~10, long ~76). Swapped, both still sit inside ±90, so it passed whether or not
+  the CHECK constraint existed.
+
+**Bite-checks are mandatory, and they must discriminate.** Breaking a policy to
+`USING (false)` proves little, because it fails every test at once. Break it to a
+*plausible but wrong* predicate instead, and require that the new test fails while the
+existing ones keep passing.
+
+---
+
+## 9. Local environment
+
+- **PostgreSQL 16 runs in a container, not via docker-compose.** Container
+  `transitos-pg`, host port **55432** (the host's own Postgres owns 5432). Databases
+  `transitos` and `transitos_test`. Roles: `transitos_migrator` (DDL owner) and
+  `transitos_app` (no CREATE, no UPDATE/DELETE on audit). Compose V2 is unavailable on
+  this machine; the committed `docker-compose.yml` is correct for anyone who has it.
+- `.env` is gitignored and present in **both** the main checkout and the worktree.
+- Load it before anything touching the database: `set -a && . ./.env && set +a`
+- `rm` is aliased to interactive here — use `command rm -f` in scripts.
+- The bash working directory drifts between the worktree and the main checkout
+  between calls. Prefix commands with an explicit `cd`.
+
+---
+
+## 10. Running it by hand — verified working 2026-09-06
 
 ```bash
-cd /home/mhdramzy/projects/TransitOS/.worktrees/foundations
+cd ~/projects/TransitOS
 set -a && . ./.env && set +a
-pnpm install
-pnpm --filter @transitos/api db:bootstrap   # idempotent; creates the transitos_app role
-pnpm --filter @transitos/api test
-pnpm --filter @transitos/api lint
+pnpm --filter @transitos/api start:dev            # :3000
+
+SEED_SUPER_ADMIN_EMAIL='you@transitos.local' \
+SEED_SUPER_ADMIN_PASSWORD='Correct-Horse9!' \
+  pnpm --filter @transitos/api seed
+
+TOKEN=$(curl -s -X POST localhost:3000/auth/login -H 'Content-Type: application/json' \
+  -d '{"emailOrPhone":"you@transitos.local","password":"Correct-Horse9!"}' \
+  | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).data.accessToken")
+
+curl -s localhost:3000/users/me -H "Authorization: Bearer $TOKEN"
+curl -s -X POST localhost:3000/schools -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"St Marys HSS Kochi"}'
 ```
 
-The app role `transitos_app` is created by the bootstrap script, not by the container.
+Live endpoints: `/healthz`, `/auth/*` (login, refresh, logout, logout-all, MFA
+setup/confirm/verify), `/users/me`, `/schools*`.
+
+**There is no UI of any kind**, and no transport endpoints yet — the transport tables
+exist in the database, but their HTTP surface begins at Task 8 and is complete at
+Task 16. A dev server may still be running from the last session;
+`pkill -f "nest start"` stops it.
+
+**Housekeeping:** the dev database `transitos` holds ~1,126 test-fixture schools
+("Springfield School", "School A", "Audited School <uuid>") from a test run that
+pointed at it instead of `transitos_test`. Harmless; `db:bootstrap` + `seed` gives a
+clean slate.
 
 ---
 
-## 3. Progress — what is done
+## 11. Road ahead
 
-Tasks 1–5 are complete and reviewed clean. Task 6 is implemented and its review was in flight when this was written; check `git log` and the ledger for its outcome.
-
-| Task | State | Commits |
-|---|---|---|
-| 1 — monorepo scaffold, NestJS, `/healthz`, CI, ESLint | complete, review clean | `d7d65c8`, `4d10ea2` |
-| 2 — zod env validation, fail-fast config | complete, review clean | `7789525` |
-| 3 — two DB roles, `core`/`audit` schemas, data sources | complete, review clean (1 fix round) | `97ec4d3`, `85f5972` |
-| 4 — `core.schools` + RLS | complete, review clean (1 fix round) | `39a23c6`, `9dca638` |
-| 5 — `core.users` + RLS + login carve-out | complete, review clean | `700996e` |
-| 6 — refresh_tokens / password_history / mfa_credentials | complete, review clean | `2139950` |
-| 7 — `audit.audit_logs`, append-only via grants | complete, review clean | `b47b711` |
-| 8 — AES-256-GCM secret box | complete, review clean (1 fix round) | `348fc3e`, `315b4e5` |
-| 9 — Argon2id + password policy | complete, review clean (1 fix round) | `23fe228`, `1834bb4`, `1b7dda5` |
-| 10 — JWT access + MFA-challenge tokens | complete, review clean (1 fix round) | `2208b20`, `1a14789` |
-| 11 — tenancy context (ALS + interceptor) | complete, review clean (1 fix round) | `eeb123b`, `c7696d1` |
-| 12 — refresh-token lifecycle | implemented, fix round 1 in flight | `f0b1634` |
-| 13–23 | not started | — |
-
-(`d11875c` between tasks 7 and 8 is the docs commit that added this file, ARCHITECTURE.md and PROJECT-REQUIREMENTS.md.)
-
-Verified live state: migrations `InitSchemas`, `CreateSchools`, `CreateUsers`, `CreateAuthTables`, `CreateAuditLogs` applied; tables `core.schools`, `core.users`, `core.refresh_tokens`, `core.password_history`, `core.mfa_credentials`, `audit.audit_logs` exist, all with `gen_random_uuid()` id defaults. 49 tests passing.
-
-**The database layer is finished.** Everything remaining is application code.
-
-**Remaining tasks (10–23)**, each fully specified in the plan: 10 JWT token service · 11 tenancy context (AsyncLocalStorage + interceptor) · 12 refresh-token lifecycle · 13 TOTP MFA · 14 audit service · 15 guards/decorators · 16 AuthService + controller · 17 response envelope + exception filter · 18 UsersModule · 19 SchoolsModule · 20 AppModule wiring · 21 seed script · 22 e2e tests · 23 README + acceptance.
-
-**Queued after all platform work — marketing landing page.** Requested by the user; to be built last, after Foundations and (at minimum) enough of the platform to demo. Tracked as a standalone deliverable, not a ninth sub-project, since it shares no stack or architecture with the platform. What it must argue — audience, positioning, and the specific proof points — is written down in `PROJECT-REQUIREMENTS.md` §4 so it does not have to be re-derived.
+Sub-project **2b** (trip engine — the state machine GPS, attendance, notifications and
+fee adjustments all hang off), then **2c** (admin web), then 3–8. A marketing landing
+page is queued after all platform work; its audience and positioning are already
+captured in `PROJECT-REQUIREMENTS.md` §4.
 
 ---
 
-## 4. The process being followed
+## 12. Working agreement with the user
 
-Superpowers **subagent-driven development**: one fresh implementer subagent per task → task review (spec compliance + quality) → fix loop if needed (max 5 rounds) → next task. After all 23, a whole-branch review, then `finishing-a-development-branch`.
-
-To resume, for task N:
-
-```bash
-# from the worktree
-SKILL=~/.claude/plugins/cache/claude-plugins-official/superpowers/6.3.0/skills/subagent-driven-development
-$SKILL/scripts/task-brief docs/superpowers/plans/2026-09-05-foundations.md N     # writes task-N-brief.md
-$SKILL/scripts/review-package docs/superpowers/plans/2026-09-05-foundations.md BASE HEAD
-```
-
-Dispatch templates live in `$SKILL/implementer-prompt.md`, `task-reviewer-prompt.md`, `re-review-prompt.md`. Record `BASE` (`git rev-parse HEAD`) *before* dispatching each implementer — review packages need it, and `HEAD~1` is wrong for multi-commit tasks.
-
-Rules that have mattered in practice:
-- Never run two implementer subagents in parallel.
-- Minor findings never enter the fix loop; they are logged and triaged at the final review.
-- A finding that conflicts with the plan is decided by the controller, with the **spec** as binding authority, and the decision recorded.
-- Implementers never spawn their own reviewers.
-
----
-
-## 5. Decisions made during execution (rulings)
-
-These resolve gaps and conflicts found in the plan or environment. They are binding on the remaining tasks. Each is stated with what it costs if wrong.
-
-**Already applied (tasks 1–6):**
-
-- **R1** — Task 1 must not overwrite `.gitignore`; the existing one is broader (covers `.env`, `.worktrees/`, `.superpowers/`).
-- **R2** — CI omits the `test:e2e` step until Task 22 creates the config, otherwise CI is red for 20 tasks.
-- **R3** — Task 3 added `pnpm --filter @transitos/api db:bootstrap` to CI before `pnpm test`; nothing else creates the app role in CI.
-- **R4** — `.env.example` documents `SEED_SUPER_ADMIN_EMAIL`/`PASSWORD` as commented, seed-only vars, deliberately outside the zod schema.
-- **R11** — compose maps host **55432**/56379 because the machine's own PostgreSQL owns 5432. CI is unchanged (isolated network).
-- **R13** — Task 1 added `apps/api/.eslintrc.json`; the plan wired `pnpm lint` into CI without ever specifying a config. It **must** keep `@typescript-eslint/no-unused-vars` with `ignoreRestSiblings: true` and `argsIgnorePattern: "^_"` — Task 2's deliberate discard and the `_context` params in Tasks 11/17 fail lint without them.
-- **R14** — do not invoke `docker-compose` on this machine; use the container in §2.
-- **R15** — `bootstrap-db.ts` validates the database name via exported `databaseNameFromUrl()` (decode, then `^[A-Za-z_][A-Za-z0-9_$]{0,62}$`) before interpolating it into DDL.
-- **R16/R17** — Task 4's visibility assertions are scoped to ids created in that run, and an explicit empty-string tenant-context test exists.
-- **R18** — tests generate unique identifiers per run (`core.users.email` is UNIQUE and the test DB persists); the suite must pass twice consecutively.
-- **R19** — the carve-out's "no write power" is proven semantically (attempt the write, then re-read under super_admin and assert unchanged), never by asserting on a TypeORM `query()` return shape.
-
-- **R20** — Task 8's tamper test was made an unconditional bit flip (`byte ^ 0xff`) with an explicit `expect(tampered).not.toBe(payload)`. The original guard compared lowercase hex against uppercase `'AA'`, making it dead code and the test flaky ~1/256 of runs.
-- **R21** — `PasswordService` pins Argon2id parameters explicitly: `memoryCost: 65536, timeCost: 3, parallelism: 1`. Library defaults have changed across argon2 releases and would otherwise shift the auth profile silently on a dependency bump. Memory hardness is unchanged from the old default, so this is not a security reduction; only `parallelism` dropped (4 → 1) to cut per-hash thread pressure. Argon2 encodes parameters in the PHC hash string, so these stay retunable later with no rehash.
-- **R24** — **conflict between the two standards documents, resolved toward security.** The performance standard targets sub-300ms API responses; the security standard mandates Argon2id, which is deliberately slow. For `/auth/login` security wins: the slowness *is* the defence against offline cracking of a stolen password database. Login is governed by the cold-login budget (<3s on 4G) instead, recorded as a documented exception in `engineering-standards.md` P1. **No task may weaken hashing parameters to chase a latency number** — fix slow-feeling login with optimistic UI and background refresh, never with a weaker KDF.
-
-- **R25** — `TokenService.signAccessToken` embeds `purpose: 'access'` and `verifyAccessToken` requires it via a **positive** check (`!== 'access'`), so a future third token type fails safe. Without this, an MFA challenge token — issued after the password check but *before* the second factor, and signed with the same secret — verified as an access token, admitting a caller who never completed MFA to any route without an explicit `@Roles` requirement. The exported `AccessTokenClaims` stays at four fields; `purpose` is stripped from the returned object.
-- **R26** — Task 11's "super_admin sees every school" assertion is scoped `WHERE id IN (...)` to the run's own ids. Under super_admin RLS applies no filter, so accumulated rows from earlier runs break an exact assertion. The tenant-scoped tests stay deliberately unscoped: there RLS itself does the filtering, and that is the property under test.
-
-- **R27** — `TenantContextService` releases its `QueryRunner` on every path once `connect()` has succeeded, and only attempts `rollbackTransaction()` when a transaction actually started. Previously `connect()`/`startTransaction()` sat outside the `try/finally`, leaking a pool connection whenever `startTransaction()` threw — under exactly the load that causes it.
-- **R28** — session variables are set with bound parameters (`SELECT set_config('app.current_school_id', $1, true)`) rather than string interpolation. Values are unchanged — `'true'`/`'false'` and `''` for an absent tenant — because the RLS predicates read those exact values.
-- **R29** — the `revokeAllForUser` test seeds a **second** user and asserts their token survives. With only one user in the spec, dropping the `WHERE user_id` clause would wipe every user's sessions and the suite would still pass — and `core.refresh_tokens` has no RLS, so that test is the only control.
-- **R30** — `rotate()` claims a token with one atomic `UPDATE ... WHERE token_hash AND revoked_at IS NULL AND expires_at > now() AND device_fingerprint ... RETURNING`, proceeding only if a row came back. The prior read-then-update let two concurrent presentations of the same token both mint new pairs, defeating single-use rotation in exactly the replay scenario it exists to limit.
-
-**Still to apply (tasks 13–23):**
-
-- **R22 — Task 19:** `GET /schools` and `GET /schools/:id/users` must ship paginated (limit/offset, sane default, hard maximum). Retrofitting pagination onto a shipped endpoint is a breaking change for every client, and a school's user list reaches thousands once drivers, attendants and parents load.
-- **R23 — Task 20:** enable gzip response compression in the Nest bootstrap.
-
-- **R5 — Task 11:** use `firstValueFrom(next.handle())`, not the deprecated `.toPromise()`.
-- **R6 — Task 16:** `AuthService` must catch failures from `refreshTokenService.rotate()` and `tokenService.verifyMfaChallenge()` and rethrow `UnauthorizedException`. As written they throw plain `Error`, which the global filter maps to **500**, while the spec and Task 22's e2e both require **401**.
-- **R7 — Task 22:** `auth-lifecycle.e2e-spec.ts` must create the app in `beforeEach`/close in `afterEach`, so each test gets a fresh throttler window. Five logins in one app instance sit exactly on the 5/60s login limit.
-- **R8 — Task 20:** mark `HealthController` `@Public()` when registering the global `JwtAuthGuard`, or `/healthz` returns 401 and the task's own test fails.
-- **R10 — Task 16:** reset `app.auth_lookup` to `'false'` immediately after each credential lookup, so the carve-out is not left open for the rest of the request's transaction.
-- **R9/R18** continue to apply to every task that seeds rows.
-
----
-
-## 6. Hard-won behaviour worth not rediscovering
-
-**Pooled connections and custom GUCs.** Once *any* transaction on a pooled connection sets a custom GUC, that connection's *unset* value afterwards is the empty string `''`, not SQL `NULL` (`SET LOCAL` reverts at commit to the session value, which for a never-set custom GUC is an empty-string placeholder). Therefore:
-
-1. `NULLIF(current_setting('app.current_school_id', true), '')::uuid` is **mandatory** in every tenant policy predicate. Without it a reused connection raises `invalid input syntax for type uuid: ""` — a 500 on every unauthenticated request instead of a clean denial.
-2. A test that merely *omits* setting the variable proves nothing, because `NULL::uuid` behaves identically with or without the guard. Any new policy on a tenant-scoped table needs an explicit **empty-string** test.
-
-**FORCE ROW LEVEL SECURITY is currently inert** — the schema owner `transitos_migrator` is the container superuser, and superusers bypass RLS regardless of FORCE. It is correct to keep (it becomes load-bearing when the owner is a non-superuser, as it should be in production), but no test proves its effect and none can in this setup.
-
-**TypeORM migration glob** is `[0-9]*.{ts,js}`, narrowed from `*.{ts,js}` because the original also matched sibling `*.spec.ts` files and crashed once a second spec existed in the migrations directory. Keep the timestamp prefix on every migration filename.
-
----
-
-## 7. If you are a fresh session, start here
-
-1. Read this file, then `docs/ARCHITECTURE.md` and `docs/PROJECT-REQUIREMENTS.md`.
-2. `cd` to the worktree, confirm `git log` matches §3, restore the container/`.env` per §2 if needed.
-3. Run the suite. It should pass twice in a row. If it does not, fix that before writing anything new.
-4. Read `.superpowers/sdd/2026-09-05-foundations/progress.md` if it still exists — it has the fine-grained per-task history, including deferred minor findings for the final review.
-5. Resume at the first task in §3 marked not started, using §4's process and honouring §5's rulings.
+Terse replies, minimal narration, no progress check-ins mid-execution — execute and
+report at the end. Commits, docs, specs, plans and subagent dispatch prompts stay in
+normal prose regardless. Don't update this handoff file again unless asked.

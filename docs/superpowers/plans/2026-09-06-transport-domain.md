@@ -2874,3 +2874,909 @@ Expected: PASS, 7 tests. Then the full suite twice, green both times.
 git add apps/api/src/transport/students/
 git commit -m "feat: add guardian links granting parents scoped access to their children"
 ```
+
+---
+
+### Task 10: Vehicles
+
+**Files:**
+- Create: `apps/api/src/transport/vehicles/vehicles.service.ts`
+- Create: `apps/api/src/transport/vehicles/vehicles.controller.ts`
+- Create: `apps/api/src/transport/vehicles/vehicles.module.ts`
+- Create: `apps/api/src/transport/vehicles/dto/create-vehicle.dto.ts`
+- Create: `apps/api/src/transport/vehicles/dto/update-vehicle.dto.ts`
+- Create: `apps/api/src/transport/vehicles/dto/vehicle-response.dto.ts`
+- Test: `apps/api/src/transport/vehicles/vehicles.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `Vehicle`, `VehicleOwnership`, `VehicleStatus` (Task 3); `requireSchoolId` and `asConflict` from `../students/students.service` (Task 7); `TenantContextService`, `AuditService`, `PaginationQueryDto`.
+- Produces: `VehiclesService` with `create(claims, dto)`, `findAll(claims, limit, offset)`, `findById(claims, id)`, `update(claims, id, dto)`; `VehicleResponseDto` + `toVehicleResponse`; `VehiclesModule`.
+
+No ABAC here. A vehicle is not personal data and carries no per-person scope — every `school_admin` in a school sees the whole fleet, and RLS keeps other schools out. Routes (Task 12) reference vehicles, and drivers see their route's default vehicle through the route response rather than through this module.
+
+The one domain rule worth enforcing: `ownership_type` other than `school_owned` requires `operator_name`. Spec §2 records that Kerala school transport is genuinely mixed, and a contracted bus with no named operator is an unusable record — there is nobody to call when it does not arrive.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/vehicles/vehicles.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { VehiclesService } from './vehicles.service';
+
+describe('VehiclesService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: VehiclesService;
+
+  let schoolId: string;
+  let adminId: string;
+  let vehicleId: string;
+
+  const registrationNumber = `KL-07-${randomUUID().slice(0, 4).toUpperCase()}`;
+
+  const adminClaims = (): AccessTokenClaims => ({
+    sub: adminId,
+    schoolId,
+    role: 'school_admin',
+    isSuperAdmin: false,
+  });
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    service = new VehiclesService(tenantContextService, new AuditService(tenantContextService));
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Vehicles School') RETURNING id`,
+      );
+      schoolId = school.id;
+      const [admin] = await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'school_admin', $2, 'x', 'Admin') RETURNING id`,
+        [schoolId, `vehicles-admin-${randomUUID()}@example.com`],
+      );
+      adminId = admin.id;
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('creates a school-owned vehicle and audits it', async () => {
+    const vehicle = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), {
+        registrationNumber,
+        capacity: 42,
+        ownershipType: 'school_owned',
+      }),
+    );
+
+    expect(vehicle.status).toBe('active');
+    expect(vehicle.operatorName).toBeNull();
+    vehicleId = vehicle.id;
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action, entity_type FROM audit.audit_logs WHERE entity_id = $1`, [vehicle.id]),
+    );
+    expect(rows).toEqual([{ action: 'vehicle.created', entity_type: 'vehicle' }]);
+  });
+
+  it('requires an operator name for a vehicle that is not school-owned', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), {
+          registrationNumber: `KL-07-${randomUUID().slice(0, 4).toUpperCase()}`,
+          capacity: 30,
+          ownershipType: 'contracted',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('accepts a contracted vehicle when the operator is named', async () => {
+    const vehicle = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), {
+        registrationNumber: `KL-07-${randomUUID().slice(0, 4).toUpperCase()}`,
+        capacity: 30,
+        ownershipType: 'contracted',
+        operatorName: 'Nair Travels',
+      }),
+    );
+
+    expect(vehicle.operatorName).toBe('Nair Travels');
+  });
+
+  it('rejects a duplicate registration number within the school', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), {
+          registrationNumber,
+          capacity: 20,
+          ownershipType: 'school_owned',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('updates a vehicle and audits the update', async () => {
+    const updated = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.update(adminClaims(), vehicleId, { status: 'maintenance', capacity: 40 }),
+    );
+
+    expect(updated.status).toBe('maintenance');
+    expect(updated.capacity).toBe(40);
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1 ORDER BY created_at`, [
+          vehicleId,
+        ]),
+    );
+    expect(rows.map((row: { action: string }) => row.action)).toEqual([
+      'vehicle.created',
+      'vehicle.updated',
+    ]);
+  });
+
+  it('keeps the operator-name rule on update', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.update(adminClaims(), vehicleId, { ownershipType: 'contracted' }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('raises NotFound for an unknown vehicle', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.findById(adminClaims(), randomUUID()),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+The "keeps the operator-name rule on update" case is the one that is easy to get wrong. A `PATCH` that changes only `ownershipType` has to be validated against the **merged** record, not against the patch — validating the patch alone would let a school-owned bus become contracted with no operator, which is exactly the state the create-time rule exists to prevent.
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- vehicles.service`
+Expected: FAIL — `Cannot find module './vehicles.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/vehicles/dto/create-vehicle.dto.ts`:
+```ts
+import { IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { Type } from 'class-transformer';
+import { VehicleOwnership } from '../../../entities/vehicle.entity';
+
+const OWNERSHIP_TYPES: VehicleOwnership[] = ['school_owned', 'contracted', 'other'];
+
+export class CreateVehicleDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(32)
+  registrationNumber: string;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(120)
+  capacity: number;
+
+  @IsIn(OWNERSHIP_TYPES)
+  ownershipType: VehicleOwnership;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  operatorName?: string;
+}
+```
+
+`apps/api/src/transport/vehicles/dto/update-vehicle.dto.ts`:
+```ts
+import { IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import { VehicleOwnership, VehicleStatus } from '../../../entities/vehicle.entity';
+
+const OWNERSHIP_TYPES: VehicleOwnership[] = ['school_owned', 'contracted', 'other'];
+const STATUSES: VehicleStatus[] = ['active', 'maintenance', 'retired'];
+
+export class UpdateVehicleDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(120)
+  capacity?: number;
+
+  @IsOptional()
+  @IsIn(OWNERSHIP_TYPES)
+  ownershipType?: VehicleOwnership;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  operatorName?: string | null;
+
+  @IsOptional()
+  @IsIn(STATUSES)
+  status?: VehicleStatus;
+}
+```
+
+`registrationNumber` is not updatable, on the same reasoning as `admissionNumber`: it identifies a physical vehicle against documents this system does not own.
+
+`apps/api/src/transport/vehicles/dto/vehicle-response.dto.ts`:
+```ts
+import { Vehicle, VehicleOwnership, VehicleStatus } from '../../../entities/vehicle.entity';
+
+export interface VehicleResponseDto {
+  id: string;
+  registrationNumber: string;
+  capacity: number;
+  ownershipType: VehicleOwnership;
+  operatorName: string | null;
+  status: VehicleStatus;
+}
+
+export function toVehicleResponse(vehicle: Vehicle): VehicleResponseDto {
+  return {
+    id: vehicle.id,
+    registrationNumber: vehicle.registrationNumber,
+    capacity: vehicle.capacity,
+    ownershipType: vehicle.ownershipType,
+    operatorName: vehicle.operatorName,
+    status: vehicle.status,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/vehicles/vehicles.service.ts`:
+```ts
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { Vehicle, VehicleOwnership } from '../../entities/vehicle.entity';
+import { Page, asConflict, requireSchoolId } from '../students/students.service';
+import { CreateVehicleDto } from './dto/create-vehicle.dto';
+import { UpdateVehicleDto } from './dto/update-vehicle.dto';
+
+/**
+ * A contracted or otherwise non-school vehicle must name its operator: when the
+ * bus does not turn up, the operator is who the school calls. Checked against
+ * the merged record so a PATCH cannot reach the same invalid state a POST is
+ * prevented from creating.
+ */
+function assertOperatorNamed(ownershipType: VehicleOwnership, operatorName: string | null): void {
+  if (ownershipType !== 'school_owned' && !operatorName) {
+    throw new BadRequestException(
+      `operatorName is required when ownershipType is '${ownershipType}'`,
+    );
+  }
+}
+
+@Injectable()
+export class VehiclesService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+  ) {}
+
+  async create(claims: AccessTokenClaims, dto: CreateVehicleDto): Promise<Vehicle> {
+    const schoolId = requireSchoolId(claims);
+    const operatorName = dto.operatorName ?? null;
+    assertOperatorNamed(dto.ownershipType, operatorName);
+
+    const manager = this.tenantContextService.getManager();
+    let vehicle: Vehicle;
+    try {
+      vehicle = await manager.getRepository(Vehicle).save({
+        schoolId,
+        registrationNumber: dto.registrationNumber,
+        capacity: dto.capacity,
+        ownershipType: dto.ownershipType,
+        operatorName,
+        status: 'active' as const,
+      });
+    } catch (error) {
+      throw asConflict(error, 'A vehicle with that registration number already exists');
+    }
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'vehicle.created',
+      entityType: 'vehicle',
+      entityId: vehicle.id,
+    });
+
+    return vehicle;
+  }
+
+  async findAll(
+    _claims: AccessTokenClaims,
+    limit: number,
+    offset: number,
+  ): Promise<Page<Vehicle>> {
+    const [items, total] = await this.tenantContextService
+      .getManager()
+      .getRepository(Vehicle)
+      .findAndCount({ take: limit, skip: offset, order: { registrationNumber: 'ASC' } });
+    return { items, total };
+  }
+
+  async findById(_claims: AccessTokenClaims, id: string): Promise<Vehicle> {
+    const vehicle = await this.tenantContextService
+      .getManager()
+      .getRepository(Vehicle)
+      .findOne({ where: { id } });
+    if (!vehicle) {
+      throw new NotFoundException('Vehicle not found');
+    }
+    return vehicle;
+  }
+
+  async update(
+    claims: AccessTokenClaims,
+    id: string,
+    dto: UpdateVehicleDto,
+  ): Promise<Vehicle> {
+    const schoolId = requireSchoolId(claims);
+    const repository = this.tenantContextService.getManager().getRepository(Vehicle);
+
+    const existing = await repository.findOne({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException('Vehicle not found');
+    }
+
+    const patch: Partial<Vehicle> = {};
+    if (dto.capacity !== undefined) patch.capacity = dto.capacity;
+    if (dto.ownershipType !== undefined) patch.ownershipType = dto.ownershipType;
+    if (dto.operatorName !== undefined) patch.operatorName = dto.operatorName;
+    if (dto.status !== undefined) patch.status = dto.status;
+
+    const merged = { ...existing, ...patch };
+    assertOperatorNamed(merged.ownershipType, merged.operatorName);
+
+    const updated = await repository.save(merged);
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'vehicle.updated',
+      entityType: 'vehicle',
+      entityId: updated.id,
+    });
+
+    return updated;
+  }
+}
+```
+
+`findAll` and `findById` take `_claims` they do not read. The parameter stays so every service in this sub-project has the same shape and so adding a scope rule later — a contractor account that sees only its own buses, say — is a change inside the method rather than a change to every caller.
+
+- [ ] **Step 5: Write the controller and module**
+
+`apps/api/src/transport/vehicles/vehicles.controller.ts` follows Task 8's `StudentsController` exactly, with `@Roles('school_admin')` on all four handlers, `ParseUUIDPipe` on `:id`, `PaginationQueryDto` on the list, and `toVehicleResponse` mapping every return.
+
+```ts
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import { Roles } from '../../auth/decorators/roles.decorator';
+import { CurrentUser } from '../../auth/decorators/current-user.decorator';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { PaginatedResponse, PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import { VehiclesService } from './vehicles.service';
+import { CreateVehicleDto } from './dto/create-vehicle.dto';
+import { UpdateVehicleDto } from './dto/update-vehicle.dto';
+import { VehicleResponseDto, toVehicleResponse } from './dto/vehicle-response.dto';
+
+@Controller('vehicles')
+@Roles('school_admin')
+export class VehiclesController {
+  constructor(private readonly vehiclesService: VehiclesService) {}
+
+  @Post()
+  async create(
+    @CurrentUser() user: AccessTokenClaims,
+    @Body() dto: CreateVehicleDto,
+  ): Promise<VehicleResponseDto> {
+    return toVehicleResponse(await this.vehiclesService.create(user, dto));
+  }
+
+  @Get()
+  async findAll(
+    @CurrentUser() user: AccessTokenClaims,
+    @Query() pagination: PaginationQueryDto,
+  ): Promise<PaginatedResponse<VehicleResponseDto>> {
+    const { items, total } = await this.vehiclesService.findAll(
+      user,
+      pagination.limit,
+      pagination.offset,
+    );
+    return {
+      items: items.map(toVehicleResponse),
+      total,
+      limit: pagination.limit,
+      offset: pagination.offset,
+    };
+  }
+
+  @Get(':id')
+  async findOne(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<VehicleResponseDto> {
+    return toVehicleResponse(await this.vehiclesService.findById(user, id));
+  }
+
+  @Patch(':id')
+  async update(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateVehicleDto,
+  ): Promise<VehicleResponseDto> {
+    return toVehicleResponse(await this.vehiclesService.update(user, id, dto));
+  }
+}
+```
+
+The class-level `@Roles('school_admin')` works because `RolesGuard` uses `getAllAndOverride` across handler and class — a handler with no decorator of its own inherits the class's.
+
+`apps/api/src/transport/vehicles/vehicles.module.ts`:
+```ts
+import { Module } from '@nestjs/common';
+import { AuthModule } from '../../auth/auth.module';
+import { AuditModule } from '../../audit/audit.module';
+import { VehiclesController } from './vehicles.controller';
+import { VehiclesService } from './vehicles.service';
+
+@Module({
+  imports: [AuthModule, AuditModule],
+  controllers: [VehiclesController],
+  providers: [VehiclesService],
+  exports: [VehiclesService],
+})
+export class VehiclesModule {}
+```
+
+- [ ] **Step 6: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- vehicles.service`
+Expected: PASS, 7 tests. Then the full suite twice, green both times.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/api/src/transport/vehicles/
+git commit -m "feat: add vehicles module with ownership and operator-name rules"
+```
+
+---
+
+### Task 11: Stops
+
+**Files:**
+- Create: `apps/api/src/transport/stops/stops.service.ts`
+- Create: `apps/api/src/transport/stops/stops.controller.ts`
+- Create: `apps/api/src/transport/stops/stops.module.ts`
+- Create: `apps/api/src/transport/stops/dto/create-stop.dto.ts`
+- Create: `apps/api/src/transport/stops/dto/update-stop.dto.ts`
+- Create: `apps/api/src/transport/stops/dto/stop-response.dto.ts`
+- Test: `apps/api/src/transport/stops/stops.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `Stop` (Task 3); `requireSchoolId` from `../students/students.service`; `Page`; `TenantContextService`, `AuditService`.
+- Produces: `StopsService` with `create`, `findAll`, `findById`, `update` on the Task 10 signatures; `StopResponseDto` + `toStopResponse`; `StopsModule`.
+
+**The one trap in this task is the numeric columns.** `latitude` and `longitude` are `numeric(9,6)`, and the `pg` driver returns `numeric` as a **string**, not a number — it does that deliberately, because a JavaScript double cannot represent every value a Postgres `numeric` can. The entity types them `string` (Task 3) for that reason. So:
+
+- The DTO accepts a `number` (JSON has no other sensible type for a coordinate) and the service converts with `.toFixed(6)` before writing.
+- The response DTO converts back with `Number(...)`, so clients get numbers rather than strings.
+- The tests assert on numbers via the response mapper, and on strings when reading the entity directly.
+
+Getting this wrong produces `"9.981000"` in an API response where a map component expects `9.981`, and it will not be caught by types alone — hence a test that pins it.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/stops/stops.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { StopsService } from './stops.service';
+import { toStopResponse } from './dto/stop-response.dto';
+
+describe('StopsService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: StopsService;
+
+  let schoolId: string;
+  let adminId: string;
+  let stopId: string;
+
+  const adminClaims = (): AccessTokenClaims => ({
+    sub: adminId,
+    schoolId,
+    role: 'school_admin',
+    isSuperAdmin: false,
+  });
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    service = new StopsService(tenantContextService, new AuditService(tenantContextService));
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Stops School') RETURNING id`,
+      );
+      schoolId = school.id;
+      const [admin] = await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'school_admin', $2, 'x', 'Admin') RETURNING id`,
+        [schoolId, `stops-admin-${randomUUID()}@example.com`],
+      );
+      adminId = admin.id;
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('creates a stop with the default geofence radius and audits it', async () => {
+    const stop = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), {
+        name: 'Edappally Junction',
+        latitude: 10.024_9,
+        longitude: 76.308_1,
+      }),
+    );
+
+    expect(stop.geofenceRadiusM).toBe(150);
+    expect(stop.specialInstructions).toBeNull();
+    stopId = stop.id;
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1`, [stop.id]),
+    );
+    expect(rows).toEqual([{ action: 'stop.created' }]);
+  });
+
+  it('round-trips coordinates as numbers through the response DTO', async () => {
+    const stop = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.findById(adminClaims(), stopId),
+    );
+
+    // The pg driver hands `numeric` back as a string; the entity reflects that.
+    expect(typeof stop.latitude).toBe('string');
+
+    const response = toStopResponse(stop);
+    expect(response.latitude).toBeCloseTo(10.0249, 6);
+    expect(response.longitude).toBeCloseTo(76.3081, 6);
+    expect(typeof response.latitude).toBe('number');
+  });
+
+  it('updates the geofence radius and special instructions', async () => {
+    const updated = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.update(adminClaims(), stopId, {
+        geofenceRadiusM: 80,
+        specialInstructions: 'Pick up on the far side of the flyover',
+      }),
+    );
+
+    expect(updated.geofenceRadiusM).toBe(80);
+    expect(updated.specialInstructions).toBe('Pick up on the far side of the flyover');
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1 ORDER BY created_at`, [
+          stopId,
+        ]),
+    );
+    expect(rows.map((row: { action: string }) => row.action)).toEqual([
+      'stop.created',
+      'stop.updated',
+    ]);
+  });
+
+  it('lists stops for the school in name order', async () => {
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), { name: 'Aluva Bypass', latitude: 10.1, longitude: 76.35 }),
+    );
+
+    const page = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.findAll(adminClaims(), 50, 0),
+    );
+
+    expect(page.total).toBe(2);
+    expect(page.items.map((stop) => stop.name)).toEqual(['Aluva Bypass', 'Edappally Junction']);
+  });
+
+  it('raises NotFound for an unknown stop', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.findById(adminClaims(), randomUUID()),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- stops.service`
+Expected: FAIL — `Cannot find module './stops.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/stops/dto/create-stop.dto.ts`:
+```ts
+import { IsInt, IsLatitude, IsLongitude, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class CreateStopDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
+  name: string;
+
+  @Type(() => Number)
+  @IsLatitude()
+  latitude: number;
+
+  @Type(() => Number)
+  @IsLongitude()
+  longitude: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(20)
+  @Max(2000)
+  geofenceRadiusM?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  specialInstructions?: string;
+}
+```
+
+The radius floor of 20 m is not arbitrary: consumer GPS is routinely 10–20 m off, so a smaller geofence would never trigger reliably. Sub-project 3 owns the detection logic; this bound keeps it from being handed data it cannot work with.
+
+`apps/api/src/transport/stops/dto/update-stop.dto.ts` mirrors the create DTO with every field optional and `latitude`/`longitude` included — a stop genuinely does get moved to the other side of a junction.
+
+```ts
+import { IsInt, IsLatitude, IsLongitude, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class UpdateStopDto {
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
+  name?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsLatitude()
+  latitude?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsLongitude()
+  longitude?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(20)
+  @Max(2000)
+  geofenceRadiusM?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  specialInstructions?: string | null;
+}
+```
+
+`apps/api/src/transport/stops/dto/stop-response.dto.ts`:
+```ts
+import { Stop } from '../../../entities/stop.entity';
+
+export interface StopResponseDto {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  geofenceRadiusM: number;
+  specialInstructions: string | null;
+}
+
+// `numeric` arrives from the driver as a string. Converting here — rather than
+// leaving it to each caller — is what keeps a coordinate from reaching a map
+// component as "10.024900".
+export function toStopResponse(stop: Stop): StopResponseDto {
+  return {
+    id: stop.id,
+    name: stop.name,
+    latitude: Number(stop.latitude),
+    longitude: Number(stop.longitude),
+    geofenceRadiusM: stop.geofenceRadiusM,
+    specialInstructions: stop.specialInstructions,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/stops/stops.service.ts`:
+```ts
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { Stop } from '../../entities/stop.entity';
+import { Page, requireSchoolId } from '../students/students.service';
+import { CreateStopDto } from './dto/create-stop.dto';
+import { UpdateStopDto } from './dto/update-stop.dto';
+
+/** Matches the column's `numeric(9,6)` scale exactly, so no value is rounded on write. */
+const COORDINATE_SCALE = 6;
+const toCoordinate = (value: number): string => value.toFixed(COORDINATE_SCALE);
+
+const DEFAULT_GEOFENCE_RADIUS_M = 150;
+
+@Injectable()
+export class StopsService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+  ) {}
+
+  async create(claims: AccessTokenClaims, dto: CreateStopDto): Promise<Stop> {
+    const schoolId = requireSchoolId(claims);
+
+    const stop = await this.tenantContextService
+      .getManager()
+      .getRepository(Stop)
+      .save({
+        schoolId,
+        name: dto.name,
+        latitude: toCoordinate(dto.latitude),
+        longitude: toCoordinate(dto.longitude),
+        geofenceRadiusM: dto.geofenceRadiusM ?? DEFAULT_GEOFENCE_RADIUS_M,
+        specialInstructions: dto.specialInstructions ?? null,
+      });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'stop.created',
+      entityType: 'stop',
+      entityId: stop.id,
+    });
+
+    return stop;
+  }
+
+  async findAll(_claims: AccessTokenClaims, limit: number, offset: number): Promise<Page<Stop>> {
+    const [items, total] = await this.tenantContextService
+      .getManager()
+      .getRepository(Stop)
+      .findAndCount({ take: limit, skip: offset, order: { name: 'ASC' } });
+    return { items, total };
+  }
+
+  async findById(_claims: AccessTokenClaims, id: string): Promise<Stop> {
+    const stop = await this.tenantContextService
+      .getManager()
+      .getRepository(Stop)
+      .findOne({ where: { id } });
+    if (!stop) {
+      throw new NotFoundException('Stop not found');
+    }
+    return stop;
+  }
+
+  async update(claims: AccessTokenClaims, id: string, dto: UpdateStopDto): Promise<Stop> {
+    const schoolId = requireSchoolId(claims);
+    const repository = this.tenantContextService.getManager().getRepository(Stop);
+
+    const existing = await repository.findOne({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException('Stop not found');
+    }
+
+    const patch: Partial<Stop> = {};
+    if (dto.name !== undefined) patch.name = dto.name;
+    if (dto.latitude !== undefined) patch.latitude = toCoordinate(dto.latitude);
+    if (dto.longitude !== undefined) patch.longitude = toCoordinate(dto.longitude);
+    if (dto.geofenceRadiusM !== undefined) patch.geofenceRadiusM = dto.geofenceRadiusM;
+    if (dto.specialInstructions !== undefined) {
+      patch.specialInstructions = dto.specialInstructions;
+    }
+
+    const updated = await repository.save({ ...existing, ...patch });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'stop.updated',
+      entityType: 'stop',
+      entityId: updated.id,
+    });
+
+    return updated;
+  }
+}
+```
+
+- [ ] **Step 5: Write the controller and module**
+
+`apps/api/src/transport/stops/stops.controller.ts` is Task 10's `VehiclesController` with `@Controller('stops')`, `@Roles('school_admin')` at class level, `StopsService`, the stop DTOs and `toStopResponse`. Four handlers: `POST /stops`, `GET /stops`, `GET /stops/:id`, `PATCH /stops/:id`.
+
+`apps/api/src/transport/stops/stops.module.ts` is Task 10's `VehiclesModule` with `StopsController`/`StopsService` substituted, importing `AuthModule` and `AuditModule` and exporting `StopsService` (Task 13 consumes it to validate that a stop exists before putting it on a route).
+
+- [ ] **Step 6: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- stops.service`
+Expected: PASS, 5 tests. Then the full suite twice, green both times.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/api/src/transport/stops/
+git commit -m "feat: add stops module with coordinate and geofence handling"
+```

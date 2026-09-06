@@ -48,7 +48,9 @@ async function main(): Promise<void> {
 // when imported by tests for `databaseNameFromUrl`.
 if (require.main === module) {
   void main().catch((error) => {
-    console.error(error);
+    // A TypeORM QueryFailedError carries the failed query's `parameters`, which
+    // on this path can include the app role's password. Log only the message.
+    console.error(error instanceof Error ? error.message : error);
     process.exit(1);
   });
 }

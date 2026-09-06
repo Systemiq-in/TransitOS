@@ -54,7 +54,10 @@ async function main(): Promise<void> {
 
 if (require.main === module) {
   void main().catch((error) => {
-    console.error(error);
+    // A TypeORM QueryFailedError carries the failed query's `parameters`, which
+    // on this path includes the Argon2 hash of the seeded password. Logging the
+    // whole error would print it; log only the message.
+    console.error(error instanceof Error ? error.message : error);
     process.exit(1);
   });
 }

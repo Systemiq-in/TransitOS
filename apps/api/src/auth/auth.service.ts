@@ -30,10 +30,18 @@ export class AuthService {
   async login(
     input: { emailOrPhone: string; password: string },
     deviceInfo: string | null,
-    ipAddress: string,
+    ipAddress: string | null,
   ): Promise<LoginResult> {
     const manager = this.tenantContextService.getManager();
     const repo = manager.getRepository(User);
+
+    // I8: resolve against exactly one column, chosen by the input's shape, rather
+    // than an `OR` across both. core.users has independent UNIQUE constraints on
+    // email and phone, so two different rows can each legitimately hold the same
+    // string value in their own column; an unordered `OR ... getOne()` would then
+    // pick between them non-deterministically instead of matching the column the
+    // caller actually meant.
+    const lookupColumn = input.emailOrPhone.includes('@') ? 'email' : 'phone';
 
     // The login carve-out RLS policy (see the CreateUsers migration) requires this
     // exact set_config, scoped to the connection this query runs on. Ruling R10:
@@ -42,7 +50,7 @@ export class AuthService {
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['true']);
     const user = await repo
       .createQueryBuilder('u')
-      .where('u.email = :value OR u.phone = :value', { value: input.emailOrPhone })
+      .where(`u.${lookupColumn} = :value`, { value: input.emailOrPhone })
       .getOne();
     await manager.query(`SELECT set_config('app.auth_lookup', $1, true)`, ['false']);
 
@@ -69,7 +77,7 @@ export class AuthService {
     mfaChallengeToken: string,
     totpCode: string,
     deviceInfo: string | null,
-    ipAddress: string,
+    ipAddress: string | null,
   ): Promise<TokenPair> {
     // Ruling R6: TokenService throws a plain Error on an invalid/expired/wrong-purpose
     // token. Left unhandled that maps to a 500 via the global filter; translate to 401.
@@ -134,19 +142,23 @@ export class AuthService {
     };
   }
 
-  async logout(rawToken: string, actorUserId: string | undefined): Promise<void> {
+  async logout(
+    rawToken: string,
+    actorUserId: string | undefined,
+    schoolId: string | null = null,
+  ): Promise<void> {
     await this.refreshTokenService.revoke(rawToken);
     await this.auditService.record({
-      schoolId: null,
+      schoolId,
       actorUserId: actorUserId ?? null,
       action: 'user.logout',
     });
   }
 
-  async logoutAll(userId: string): Promise<void> {
+  async logoutAll(userId: string, schoolId: string | null = null): Promise<void> {
     await this.refreshTokenService.revokeAllForUser(userId);
     await this.auditService.record({
-      schoolId: null,
+      schoolId,
       actorUserId: userId,
       action: 'user.logout_all',
     });
@@ -155,7 +167,7 @@ export class AuthService {
   private async issueSession(
     user: User,
     deviceInfo: string | null,
-    ipAddress: string,
+    ipAddress: string | null,
   ): Promise<TokenPair> {
     const accessToken = this.tokenService.signAccessToken({
       sub: user.id,

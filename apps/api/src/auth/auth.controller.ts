@@ -9,6 +9,7 @@ import { AuthService } from './auth.service';
 import { MfaService } from './mfa.service';
 import { LoginDto } from './dto/login.dto';
 import { MfaVerifyDto } from './dto/mfa-verify.dto';
+import { MfaSetupDto } from './dto/mfa-setup.dto';
 import { MfaConfirmDto } from './dto/mfa-confirm.dto';
 import { RefreshDto } from './dto/refresh.dto';
 import { LogoutDto } from './dto/logout.dto';
@@ -28,7 +29,7 @@ export class AuthController {
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('login')
   login(@Body() dto: LoginDto, @Req() req: Request) {
-    return this.authService.login(dto, deviceInfoOf(req), req.ip ?? 'unknown');
+    return this.authService.login(dto, deviceInfoOf(req), req.ip ?? null);
   }
 
   @Public()
@@ -39,15 +40,15 @@ export class AuthController {
       dto.mfaChallengeToken,
       dto.totpCode,
       deviceInfoOf(req),
-      req.ip ?? 'unknown',
+      req.ip ?? null,
     );
   }
 
   @Roles('super_admin', 'school_admin')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @Post('mfa/setup')
-  mfaSetup(@CurrentUser() user: AccessTokenClaims) {
-    return this.mfaService.beginEnrollment(user.sub, user.sub);
+  mfaSetup(@CurrentUser() user: AccessTokenClaims, @Body() dto: MfaSetupDto) {
+    return this.mfaService.beginEnrollment(user.sub, user.sub, dto.currentTotpCode);
   }
 
   // Same limit as the public mfa/verify route: this also accepts a 6-digit TOTP
@@ -72,12 +73,12 @@ export class AuthController {
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Post('logout')
   logout(@CurrentUser() user: AccessTokenClaims, @Body() dto: LogoutDto) {
-    return this.authService.logout(dto.refreshToken, user.sub);
+    return this.authService.logout(dto.refreshToken, user.sub, user.schoolId);
   }
 
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Post('logout-all')
   logoutAll(@CurrentUser() user: AccessTokenClaims) {
-    return this.authService.logoutAll(user.sub);
+    return this.authService.logoutAll(user.sub, user.schoolId);
   }
 }

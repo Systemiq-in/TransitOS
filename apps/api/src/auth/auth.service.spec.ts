@@ -100,6 +100,28 @@ describe('AuthService', () => {
     );
   }
 
+  /** I8: seeds a user with a specific value in one contact column (bypassing the
+   * DTO layer, the same way the fixtures above bypass it) so the deterministic
+   * lookup in AuthService.login can be exercised directly against real rows. */
+  async function createUserWithContact(
+    column: 'email' | 'phone',
+    value: string,
+    password: string,
+  ): Promise<string> {
+    return tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      async (manager) => {
+        const hash = await passwordService.hash(password);
+        const [user] = await manager.query(
+          `INSERT INTO core.users (role, school_id, ${column}, password_hash, display_name)
+           VALUES ('parent', $1, $2, $3, 'Test User') RETURNING id`,
+          [schoolId, value, hash],
+        );
+        return user.id;
+      },
+    );
+  }
+
   /** Simulates an admin disabling an account mid-flow (e.g. mid-MFA-challenge, or after a refresh token was issued). */
   async function disableUser(userId: string): Promise<void> {
     await tenantContextService.runWithTenant(
@@ -363,5 +385,108 @@ describe('AuthService', () => {
 
     expect(verifySpy).toHaveBeenCalledTimes(1);
     verifySpy.mockRestore();
+  });
+
+  // I8: core.users has independent UNIQUE constraints on email and phone, so two
+  // different rows can each legitimately hold the same string value in their own
+  // column. The old `WHERE email = :v OR phone = :v` / getOne() lookup had no
+  // ordering, so which row won was undefined by SQL and, on this fixture (the
+  // email-column row inserted first), it lands on the wrong one. The fixed
+  // lookup must resolve to the phone-column row every time, because the value
+  // being looked up is phone-shaped (no '@').
+  it('resolves login deterministically by column shape when a value collides across two users', async () => {
+    const collidingValue = `+1${Math.floor(1_000_000_000 + Math.random() * 9_000_000_000)}`;
+    // Inserted first, so an unordered query without the fix is biased toward
+    // returning this row instead of the phone-column one below.
+    await createUserWithContact('email', collidingValue, 'Correct-Horse9!-B');
+    await createUserWithContact('phone', collidingValue, 'Correct-Horse9!-A');
+
+    const result = await tenantContextService.runWithTenant(null, () =>
+      authService.login(
+        { emailOrPhone: collidingValue, password: 'Correct-Horse9!-A' },
+        'device-A',
+        '127.0.0.1',
+      ),
+    );
+    expect(result.mfaRequired).toBe(false);
+
+    await expect(
+      tenantContextService.runWithTenant(null, () =>
+        authService.login(
+          { emailOrPhone: collidingValue, password: 'Correct-Horse9!-B' },
+          'device-A',
+          '127.0.0.1',
+        ),
+      ),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  // I10: logout and logout-all used to record schoolId: null unconditionally, so
+  // a school_admin reviewing their tenant-scoped audit trail saw logins with no
+  // matching logouts.
+  it('records the caller\'s school id on logout, not null', async () => {
+    const email = emailFor('logout-school-id');
+    await createUser(email, 'parent', 'Correct-Horse9!');
+
+    const login = await tenantContextService.runWithTenant(null, () =>
+      authService.login({ emailOrPhone: email, password: 'Correct-Horse9!' }, 'device-A', '127.0.0.1'),
+    );
+    if (login.mfaRequired) throw new Error('unexpected mfa challenge');
+
+    await tenantContextService.runWithTenant(null, () =>
+      authService.logout(login.refreshToken, undefined, schoolId),
+    );
+
+    const rows = await tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId, role: 'school_admin', isSuperAdmin: false },
+      (manager) =>
+        manager.query(
+          `SELECT school_id FROM audit.audit_logs WHERE action = 'user.logout' AND school_id = $1 ORDER BY created_at DESC LIMIT 1`,
+          [schoolId],
+        ),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].school_id).toBe(schoolId);
+  });
+
+  it("records the caller's school id on logout-all, not null", async () => {
+    const email = emailFor('logout-all-school-id');
+    const userId = await createUser(email, 'parent', 'Correct-Horse9!');
+
+    await tenantContextService.runWithTenant(null, () => authService.logoutAll(userId, schoolId));
+
+    const rows = await tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId, role: 'school_admin', isSuperAdmin: false },
+      (manager) =>
+        manager.query(
+          `SELECT school_id FROM audit.audit_logs WHERE action = 'user.logout_all' AND actor_user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+          [userId],
+        ),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].school_id).toBe(schoolId);
+  });
+
+  // D1 (promoted from deferred): the app.auth_lookup carve-out must close after
+  // login() returns. This is the only RLS control in the branch without an
+  // executed proof — three call sites set and reset the flag, but nothing had
+  // run a follow-up query in the same transaction to confirm RLS re-engages.
+  it('closes the app.auth_lookup carve-out after login(), so a follow-up query in the same transaction sees nothing', async () => {
+    const email = emailFor('auth-lookup-carveout');
+    await createUser(email, 'driver', 'Correct-Horse9!');
+
+    const countAfterLogin = await tenantContextService.runWithTenant(null, async (manager) => {
+      const result = await authService.login(
+        { emailOrPhone: email, password: 'Correct-Horse9!' },
+        'device-A',
+        '127.0.0.1',
+      );
+      expect(result.mfaRequired).toBe(false);
+
+      const [{ count }] = await manager.query(`SELECT count(*) FROM core.users`);
+      return Number(count);
+    });
+
+    expect(countAfterLogin).toBe(0);
   });
 });

@@ -47,6 +47,25 @@ describe('MfaService', () => {
 
   const runNull = <T>(work: () => Promise<T>) => tenantContextService.runWithTenant(null, work);
 
+  /** Creates a fresh super_admin row so a test can drive its own enrollment
+   * lifecycle without inheriting an `enabled_at` set by an earlier test on the
+   * shared `userId` above (see I6: beginEnrollment no longer clears enabled_at,
+   * so once a user is enabled in one test it stays enabled for the rest of the
+   * suite unless isolated like this). */
+  async function createUser(email: string): Promise<string> {
+    return tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      async (manager) => {
+        const [user] = await manager.query(
+          `INSERT INTO core.users (role, email, password_hash, display_name)
+           VALUES ('super_admin', $1, 'hash', 'Root') RETURNING id`,
+          [email],
+        );
+        return user.id as string;
+      },
+    );
+  }
+
   it('reports MFA disabled before enrollment', async () => {
     expect(await runNull(() => service.isEnabled(userId))).toBe(false);
   });
@@ -95,9 +114,12 @@ describe('MfaService', () => {
   });
 
   it('rejects confirmEnrollment with an invalid code', async () => {
-    await runNull(() => service.beginEnrollment(userId, `mfa-test-2-${runId}@example.com`));
-    await expect(runNull(() => service.confirmEnrollment(userId, '000000'))).rejects.toThrow();
-    expect(await runNull(() => service.isEnabled(userId))).toBe(false);
+    const freshUserId = await createUser(`mfa-test-2-${runId}@example.com`);
+    await runNull(() => service.beginEnrollment(freshUserId, `mfa-test-2-${runId}@example.com`));
+    await expect(
+      runNull(() => service.confirmEnrollment(freshUserId, '000000')),
+    ).rejects.toThrow();
+    expect(await runNull(() => service.isEnabled(freshUserId))).toBe(false);
   });
 
   it('rejects confirmEnrollment when enrollment was never begun', async () => {
@@ -108,34 +130,97 @@ describe('MfaService', () => {
   });
 
   it('verifies a correct code once enabled', async () => {
+    const freshUserId = await createUser(`mfa-test-3-${runId}@example.com`);
     const { secret } = await runNull(() =>
-      service.beginEnrollment(userId, `mfa-test-3-${runId}@example.com`),
+      service.beginEnrollment(freshUserId, `mfa-test-3-${runId}@example.com`),
     );
     const code = authenticator.generate(secret);
-    await runNull(() => service.confirmEnrollment(userId, code));
+    await runNull(() => service.confirmEnrollment(freshUserId, code));
 
     const nextCode = authenticator.generate(secret);
-    expect(await runNull(() => service.verifyCode(userId, nextCode))).toBe(true);
+    expect(await runNull(() => service.verifyCode(freshUserId, nextCode))).toBe(true);
   });
 
   it('rejects an incorrect code once enabled', async () => {
+    const freshUserId = await createUser(`mfa-test-4-${runId}@example.com`);
     const { secret } = await runNull(() =>
-      service.beginEnrollment(userId, `mfa-test-4-${runId}@example.com`),
+      service.beginEnrollment(freshUserId, `mfa-test-4-${runId}@example.com`),
     );
     const code = authenticator.generate(secret);
-    await runNull(() => service.confirmEnrollment(userId, code));
+    await runNull(() => service.confirmEnrollment(freshUserId, code));
 
-    expect(await runNull(() => service.verifyCode(userId, '000000'))).toBe(false);
+    expect(await runNull(() => service.verifyCode(freshUserId, '000000'))).toBe(false);
   });
 
-  it('re-enrollment updates the existing row rather than inserting a second one', async () => {
-    await runNull(() => service.beginEnrollment(userId, `mfa-test-5a-${runId}@example.com`));
-    await runNull(() => service.beginEnrollment(userId, `mfa-test-5b-${runId}@example.com`));
+  it('re-enrollment before confirmation updates the existing row rather than inserting a second one', async () => {
+    const freshUserId = await createUser(`mfa-test-5-${runId}@example.com`);
+    await runNull(() => service.beginEnrollment(freshUserId, `mfa-test-5a-${runId}@example.com`));
+    await runNull(() => service.beginEnrollment(freshUserId, `mfa-test-5b-${runId}@example.com`));
 
     const manager = dataSource.manager;
     const rows = await manager.query(`SELECT id FROM core.mfa_credentials WHERE user_id = $1`, [
-      userId,
+      freshUserId,
     ]);
     expect(rows).toHaveLength(1);
+  });
+
+  // I6: re-enrolling an already-enabled credential without proving possession of
+  // the current device would silently turn MFA off — the entire vulnerability
+  // this fix closes.
+  describe('re-enrolling an already-enabled credential (I6)', () => {
+    async function enableFreshUser(label: string): Promise<{ userId: string; secret: string }> {
+      const email = `mfa-test-i6-${label}-${runId}@example.com`;
+      const freshUserId = await createUser(email);
+      const { secret } = await runNull(() => service.beginEnrollment(freshUserId, email));
+      await runNull(() => service.confirmEnrollment(freshUserId, authenticator.generate(secret)));
+      return { userId: freshUserId, secret };
+    }
+
+    it('rejects re-enrollment without a current TOTP code, and MFA stays enabled', async () => {
+      const { userId: enabledUserId, secret } = await enableFreshUser('no-code');
+
+      await expect(
+        runNull(() => service.beginEnrollment(enabledUserId, 'irrelevant-label')),
+      ).rejects.toThrow();
+
+      expect(await runNull(() => service.isEnabled(enabledUserId))).toBe(true);
+      // The old (still-valid) secret must not have been replaced.
+      expect(await runNull(() => service.verifyCode(enabledUserId, authenticator.generate(secret)))).toBe(
+        true,
+      );
+    });
+
+    it('rejects re-enrollment with a wrong current TOTP code, and MFA stays enabled', async () => {
+      const { userId: enabledUserId, secret } = await enableFreshUser('wrong-code');
+
+      await expect(
+        runNull(() => service.beginEnrollment(enabledUserId, 'irrelevant-label', '000000')),
+      ).rejects.toThrow();
+
+      expect(await runNull(() => service.isEnabled(enabledUserId))).toBe(true);
+      expect(await runNull(() => service.verifyCode(enabledUserId, authenticator.generate(secret)))).toBe(
+        true,
+      );
+    });
+
+    it('proceeds with a valid current TOTP code, replacing the secret while MFA remains enabled throughout', async () => {
+      const { userId: enabledUserId, secret: oldSecret } = await enableFreshUser('valid-code');
+      const validCode = authenticator.generate(oldSecret);
+
+      const { secret: newSecret } = await runNull(() =>
+        service.beginEnrollment(enabledUserId, 'irrelevant-label', validCode),
+      );
+
+      expect(newSecret).not.toBe(oldSecret);
+      // enabled_at was never cleared during the swap.
+      expect(await runNull(() => service.isEnabled(enabledUserId))).toBe(true);
+
+      await runNull(() =>
+        service.confirmEnrollment(enabledUserId, authenticator.generate(newSecret)),
+      );
+      expect(
+        await runNull(() => service.verifyCode(enabledUserId, authenticator.generate(newSecret))),
+      ).toBe(true);
+    });
   });
 });

@@ -40,7 +40,7 @@ export class CreateTransportStudents1757030600000 implements MigrationInterface 
           OR school_id = NULLIF(current_setting('app.current_school_id', true), '')::uuid
         )
     `);
-    await queryRunner.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON transport.students TO ${appRole}`);
+    await queryRunner.query(`GRANT SELECT, INSERT, UPDATE ON transport.students TO ${appRole}`);
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {

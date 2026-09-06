@@ -28,12 +28,15 @@ describe('CreateTransportStudents migration', () => {
   const asTenant = async (schoolId: string, sql: string, params: unknown[] = []): Promise<unknown[]> => {
     const runner = app.createQueryRunner();
     await runner.startTransaction();
-    await runner.query(`SELECT set_config('app.is_super_admin', $1, true)`, ['false']);
-    await runner.query(`SELECT set_config('app.current_school_id', $1, true)`, [schoolId]);
-    const rows = (await runner.query(sql, params)) as unknown[];
-    await runner.rollbackTransaction();
-    await runner.release();
-    return rows;
+    try {
+      await runner.query(`SELECT set_config('app.is_super_admin', $1, true)`, ['false']);
+      await runner.query(`SELECT set_config('app.current_school_id', $1, true)`, [schoolId]);
+      const rows = (await runner.query(sql, params)) as unknown[];
+      await runner.rollbackTransaction();
+      return rows;
+    } finally {
+      await runner.release();
+    }
   };
 
   beforeAll(async () => {
@@ -57,6 +60,17 @@ describe('CreateTransportStudents migration', () => {
     const rows = await migrator.query(
       `SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'transport'`,
     );
+    expect(rows).toHaveLength(1);
+  });
+
+  it('allows a tenant session to read its own school students', async () => {
+    const admission = `OWN-${randomUUID()}`;
+    await asSuperAdmin(async (q) => {
+      await q(`INSERT INTO transport.students (school_id, admission_number, full_name, grade)
+               VALUES ('${schoolA}', '${admission}', 'Zara', '5')`);
+    });
+
+    const rows = await asTenant(schoolA, `SELECT id FROM transport.students WHERE admission_number = $1`, [admission]);
     expect(rows).toHaveLength(1);
   });
 

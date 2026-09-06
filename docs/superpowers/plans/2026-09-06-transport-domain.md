@@ -5099,9 +5099,16 @@ describe('AssignmentsService', () => {
 
 "Allows a fresh assignment once the previous one has ended" is the test that keeps rule 2 from being over-applied. An implementation that checked only `(student_id, direction)` without consulting the dates would reject this and make a mid-year route change impossible — the precise scenario the date columns exist for.
 
-Note that ending an assignment sets `effective_to` to today, so it is not `>= CURRENT_DATE`-active... except it *is*: today is not before today. The active predicate is `effective_to IS NULL OR effective_to >= CURRENT_DATE`, which today's date satisfies. So the replacement in that test would collide. Resolve it by making `end` set `effective_to = CURRENT_DATE` **and** the active check exclude same-day-ended rows: the predicate for "blocks a new assignment" is `effective_to IS NULL OR effective_to > CURRENT_DATE`. A ride that ends today frees the slot from today. Use `>` in the conflict check and `>=` in `AbacScopeService` (Task 6), which asks a different question — who rides *today* — and must still include a student whose assignment ends today.
+**Two different "active" predicates, and they must not be unified.** `end` sets `effective_to = CURRENT_DATE`, so an assignment ended today has `effective_to` equal to today, and the two places that ask whether it is active want opposite answers:
 
-That asymmetry is deliberate and easy to "tidy" into a bug. Both predicates are correct for their own question.
+| Question | Asked by | Predicate |
+|---|---|---|
+| Does this block a new assignment? | `AssignmentsService.create` (this task) | `effective_to IS NULL OR effective_to > CURRENT_DATE` |
+| Does this student ride today? | `AbacScopeService` (Task 6) | `effective_to IS NULL OR effective_to >= CURRENT_DATE` |
+
+A route change on the day it happens needs the first to be `>`: ending the old assignment must free the slot immediately, or the replacement collides and the change is impossible until tomorrow. The driver's list needs the second to be `>=`: a child riding today is still on the bus this afternoon even though their assignment ends tonight.
+
+The asymmetry is deliberate and looks like an inconsistency worth tidying. It is not. Changing either one breaks a real day in a school office.
 
 - [ ] **Step 2: Run the test and watch it fail**
 
@@ -5222,10 +5229,15 @@ export class AssignmentsService {
     // has an ended assignment and a current one for the same direction, and
     // only the dates distinguish them. `> CURRENT_DATE` rather than `>=` so an
     // assignment ended today frees the slot from today.
+    //
+    // The direction clause is symmetric on purpose. `direction IN ($2, 'both')`
+    // is the shorter form and is wrong in one direction: it catches a new
+    // 'morning' against an existing 'both', but lets a new 'both' through when
+    // a 'morning' already exists, double-booking the child's morning ride.
     const clash = await manager.query(
       `SELECT id FROM transport.student_route_assignments
         WHERE student_id = $1
-          AND direction IN ($2, 'both')
+          AND (direction = $2 OR direction = 'both' OR $2 = 'both')
           AND (effective_to IS NULL OR effective_to > CURRENT_DATE)
         LIMIT 1`,
       [studentId, dto.direction],
@@ -5311,7 +5323,7 @@ export class AssignmentsService {
 }
 ```
 
-The clash query matches `direction IN ($2, 'both')`, so an existing `both` assignment blocks a new `morning` one. It does not, however, catch a new `both` against an existing `morning` — for that the predicate would need to be symmetric. Make it symmetric: `AND (direction = $2 OR direction = 'both' OR $2 = 'both')`. Use that form in the implementation; the shorter version above is the one an implementer is likely to reach for, and it is subtly incomplete.
+Add a test for the asymmetric case the comment describes, since the suite above does not yet cover it — create a `morning` assignment for a fresh student, then attempt a `both` assignment for that same student and expect `ConflictException`. With the symmetric predicate it passes; with `direction IN ($2, 'both')` it fails, which is exactly what makes it worth writing.
 
 - [ ] **Step 5: Write the controller and module**
 
@@ -5370,7 +5382,7 @@ The controller is mounted at `students/:studentId/assignments` rather than being
 - [ ] **Step 6: Run the test and watch it pass**
 
 Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- assignments.service`
-Expected: PASS, 9 tests.
+Expected: PASS, 10 tests — the nine written in Step 1 plus the symmetric-direction case added in Step 4.
 
 - [ ] **Step 7: Prove the scoping and stop-membership tests bite**
 

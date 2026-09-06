@@ -3780,3 +3780,1039 @@ Expected: PASS, 5 tests. Then the full suite twice, green both times.
 git add apps/api/src/transport/stops/
 git commit -m "feat: add stops module with coordinate and geofence handling"
 ```
+
+---
+
+### Task 12: Routes
+
+**Files:**
+- Create: `apps/api/src/transport/routes/routes.service.ts`
+- Create: `apps/api/src/transport/routes/routes.controller.ts`
+- Create: `apps/api/src/transport/routes/routes.module.ts`
+- Create: `apps/api/src/transport/routes/dto/create-route.dto.ts`
+- Create: `apps/api/src/transport/routes/dto/update-route.dto.ts`
+- Create: `apps/api/src/transport/routes/dto/route-response.dto.ts`
+- Test: `apps/api/src/transport/routes/routes.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `Route`, `RouteStatus` (Task 4); `Vehicle` (Task 3); `User`, `UserRole`; `requireSchoolId`, `Page` from `../students/students.service`; `TenantContextService`, `AuditService`.
+- Produces: `RoutesService` with `create(claims, dto)`, `findAll(claims, limit, offset)`, `findById(claims, id)`, `update(claims, id, dto)`; `RouteResponseDto` + `toRouteResponse`; `RoutesModule` exporting `RoutesService`.
+
+**Two rules this task owns.**
+
+First, the *role of a referenced user is checked in the service*. `default_driver_user_id` has a foreign key to `core.users`, and a foreign key cannot say "must have role `driver`" (spec §6). Without the check, a school_admin could be set as a route's driver and would then be handed every student on it by `AbacScopeService`'s driver branch — a quiet widening of access through a data-entry mistake.
+
+Second, *a driver lists only their own routes*. This is the routes-side counterpart to student scoping, and it gets a test that fails if the filter is removed.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/routes/routes.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { RoutesService } from './routes.service';
+
+describe('RoutesService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: RoutesService;
+
+  let schoolId: string;
+  let adminId: string;
+  let driverId: string;
+  let otherDriverId: string;
+  let attendantId: string;
+  let vehicleId: string;
+  let routeId: string;
+
+  const claimsFor = (role: AccessTokenClaims['role'], sub: string): AccessTokenClaims => ({
+    sub,
+    schoolId,
+    role,
+    isSuperAdmin: false,
+  });
+  const adminClaims = (): AccessTokenClaims => claimsFor('school_admin', adminId);
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    service = new RoutesService(tenantContextService, new AuditService(tenantContextService));
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Routes School') RETURNING id`,
+      );
+      schoolId = school.id;
+
+      const insertUser = async (role: string, name: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+           VALUES ($1, $2, $3, 'x', $4) RETURNING id`,
+          [schoolId, role, `routes-${role}-${randomUUID()}@example.com`, name],
+        );
+        return row.id;
+      };
+      adminId = await insertUser('school_admin', 'Admin');
+      driverId = await insertUser('driver', 'Driver One');
+      otherDriverId = await insertUser('driver', 'Driver Two');
+      attendantId = await insertUser('attendant', 'Attendant');
+
+      const [vehicle] = await manager.query(
+        `INSERT INTO transport.vehicles (school_id, registration_number, capacity, ownership_type, status)
+         VALUES ($1, $2, 40, 'school_owned', 'active') RETURNING id`,
+        [schoolId, `KL-01-${randomUUID().slice(0, 4).toUpperCase()}`],
+      );
+      vehicleId = vehicle.id;
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('creates a route with its defaults and audits it', async () => {
+    const route = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), {
+        name: 'Route 12',
+        description: 'Edappally loop',
+        defaultVehicleId: vehicleId,
+        defaultDriverUserId: driverId,
+        defaultAttendantUserId: attendantId,
+      }),
+    );
+
+    expect(route.status).toBe('active');
+    expect(route.defaultDriverUserId).toBe(driverId);
+    routeId = route.id;
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1`, [route.id]),
+    );
+    expect(rows).toEqual([{ action: 'route.created' }]);
+  });
+
+  it('rejects a default driver whose role is not driver', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), { name: 'Route 13', defaultDriverUserId: attendantId }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a default attendant whose role is not attendant', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), { name: 'Route 14', defaultAttendantUserId: driverId }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a default vehicle that does not exist in this school', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.create(adminClaims(), { name: 'Route 15', defaultVehicleId: randomUUID() }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('shows a school_admin every route in the school', async () => {
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.create(adminClaims(), { name: 'Route 20', defaultDriverUserId: otherDriverId }),
+    );
+
+    const page = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.findAll(adminClaims(), 50, 0),
+    );
+
+    expect(page.items.map((route) => route.name)).toEqual(['Route 12', 'Route 20']);
+  });
+
+  it('shows a driver only the routes they drive', async () => {
+    const page = await tenantContextService.runWithTenant(claimsFor('driver', driverId), () =>
+      service.findAll(claimsFor('driver', driverId), 50, 0),
+    );
+
+    expect(page.total).toBe(1);
+    expect(page.items[0].id).toBe(routeId);
+  });
+
+  it('refuses a driver reading a route they do not drive', async () => {
+    const otherRoute = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.findAll(adminClaims(), 50, 0),
+    );
+    const notMine = otherRoute.items.find((route) => route.id !== routeId);
+
+    await expect(
+      tenantContextService.runWithTenant(claimsFor('driver', driverId), () =>
+        service.findById(claimsFor('driver', driverId), notMine!.id),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('updates a route and audits the update', async () => {
+    const updated = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.update(adminClaims(), routeId, { status: 'inactive', defaultDriverUserId: null }),
+    );
+
+    expect(updated.status).toBe('inactive');
+    expect(updated.defaultDriverUserId).toBeNull();
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1 ORDER BY created_at`, [
+          routeId,
+        ]),
+    );
+    expect(rows.map((row: { action: string }) => row.action)).toEqual([
+      'route.created',
+      'route.updated',
+    ]);
+  });
+});
+```
+
+"Refuses a driver reading a route they do not drive" expects **404, not 403**. A driver has no business knowing which route ids exist outside their own work; returning 403 would confirm the id is real. Task 7's students used 403 because there the caller's *role* legitimately grants student access and only the specific row is out of scope. Here the row is simply not part of the caller's world.
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- routes.service`
+Expected: FAIL — `Cannot find module './routes.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/routes/dto/create-route.dto.ts`:
+```ts
+import { IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+
+export class CreateRouteDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
+  name: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  description?: string;
+
+  @IsOptional()
+  @IsUUID()
+  defaultVehicleId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  defaultDriverUserId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  defaultAttendantUserId?: string;
+}
+```
+
+`apps/api/src/transport/routes/dto/update-route.dto.ts`:
+```ts
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength, ValidateIf } from 'class-validator';
+import { RouteStatus } from '../../../entities/route.entity';
+
+const STATUSES: RouteStatus[] = ['active', 'inactive'];
+
+// The three default_* fields are explicitly nullable: clearing a route's driver
+// when they leave the school is an ordinary operation, and `ValidateIf` lets
+// `null` through while still rejecting a malformed string.
+export class UpdateRouteDto {
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  description?: string | null;
+
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @IsUUID()
+  defaultVehicleId?: string | null;
+
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @IsUUID()
+  defaultDriverUserId?: string | null;
+
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @IsUUID()
+  defaultAttendantUserId?: string | null;
+
+  @IsOptional()
+  @IsIn(STATUSES)
+  status?: RouteStatus;
+}
+```
+
+`apps/api/src/transport/routes/dto/route-response.dto.ts`:
+```ts
+import { Route, RouteStatus } from '../../../entities/route.entity';
+
+export interface RouteResponseDto {
+  id: string;
+  name: string;
+  description: string | null;
+  defaultVehicleId: string | null;
+  defaultDriverUserId: string | null;
+  defaultAttendantUserId: string | null;
+  status: RouteStatus;
+}
+
+export function toRouteResponse(route: Route): RouteResponseDto {
+  return {
+    id: route.id,
+    name: route.name,
+    description: route.description,
+    defaultVehicleId: route.defaultVehicleId,
+    defaultDriverUserId: route.defaultDriverUserId,
+    defaultAttendantUserId: route.defaultAttendantUserId,
+    status: route.status,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/routes/routes.service.ts`:
+```ts
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { FindOptionsWhere } from 'typeorm';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { Route } from '../../entities/route.entity';
+import { Vehicle } from '../../entities/vehicle.entity';
+import { User, UserRole } from '../../entities/user.entity';
+import { Page, requireSchoolId } from '../students/students.service';
+import { CreateRouteDto } from './dto/create-route.dto';
+import { UpdateRouteDto } from './dto/update-route.dto';
+
+@Injectable()
+export class RoutesService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+  ) {}
+
+  /**
+   * A foreign key to core.users cannot express "must have role driver", so the
+   * role is checked here. This is not cosmetic validation: AbacScopeService
+   * hands every student on a route to whoever sits in default_driver_user_id,
+   * so a wrong role here silently widens access.
+   */
+  private async assertUserHasRole(
+    userId: string | null | undefined,
+    role: UserRole,
+    field: string,
+  ): Promise<void> {
+    if (!userId) {
+      return;
+    }
+    // RLS has already narrowed this lookup to the caller's school, so a user in
+    // another tenant reads as absent rather than as a role mismatch.
+    const user = await this.tenantContextService
+      .getManager()
+      .getRepository(User)
+      .findOne({ where: { id: userId } });
+    if (!user) {
+      throw new BadRequestException(`${field} does not name a user in this school`);
+    }
+    if (user.role !== role) {
+      throw new BadRequestException(
+        `${field} must name a user with role '${role}', but that user has role '${user.role}'`,
+      );
+    }
+  }
+
+  private async assertVehicleExists(vehicleId: string | null | undefined): Promise<void> {
+    if (!vehicleId) {
+      return;
+    }
+    const vehicle = await this.tenantContextService
+      .getManager()
+      .getRepository(Vehicle)
+      .findOne({ where: { id: vehicleId } });
+    if (!vehicle) {
+      throw new BadRequestException('defaultVehicleId does not name a vehicle in this school');
+    }
+  }
+
+  /**
+   * Which routes a caller may see. A driver or attendant sees only routes they
+   * are the default for; everyone else with route access sees the school's
+   * routes, which RLS has already limited to their tenant.
+   */
+  private scopeFor(claims: AccessTokenClaims): FindOptionsWhere<Route> {
+    if (claims.role === 'driver') {
+      return { defaultDriverUserId: claims.sub };
+    }
+    if (claims.role === 'attendant') {
+      return { defaultAttendantUserId: claims.sub };
+    }
+    return {};
+  }
+
+  async create(claims: AccessTokenClaims, dto: CreateRouteDto): Promise<Route> {
+    const schoolId = requireSchoolId(claims);
+
+    await this.assertVehicleExists(dto.defaultVehicleId);
+    await this.assertUserHasRole(dto.defaultDriverUserId, 'driver', 'defaultDriverUserId');
+    await this.assertUserHasRole(
+      dto.defaultAttendantUserId,
+      'attendant',
+      'defaultAttendantUserId',
+    );
+
+    const route = await this.tenantContextService
+      .getManager()
+      .getRepository(Route)
+      .save({
+        schoolId,
+        name: dto.name,
+        description: dto.description ?? null,
+        defaultVehicleId: dto.defaultVehicleId ?? null,
+        defaultDriverUserId: dto.defaultDriverUserId ?? null,
+        defaultAttendantUserId: dto.defaultAttendantUserId ?? null,
+        status: 'active' as const,
+      });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'route.created',
+      entityType: 'route',
+      entityId: route.id,
+    });
+
+    return route;
+  }
+
+  async findAll(claims: AccessTokenClaims, limit: number, offset: number): Promise<Page<Route>> {
+    const [items, total] = await this.tenantContextService
+      .getManager()
+      .getRepository(Route)
+      .findAndCount({
+        where: this.scopeFor(claims),
+        take: limit,
+        skip: offset,
+        order: { name: 'ASC' },
+      });
+    return { items, total };
+  }
+
+  /**
+   * Out-of-scope routes read as NotFound rather than Forbidden: a driver has no
+   * business learning which route ids exist outside their own work, and a 403
+   * would confirm the id is real.
+   */
+  async findById(claims: AccessTokenClaims, id: string): Promise<Route> {
+    const route = await this.tenantContextService
+      .getManager()
+      .getRepository(Route)
+      .findOne({ where: { id, ...this.scopeFor(claims) } });
+    if (!route) {
+      throw new NotFoundException('Route not found');
+    }
+    return route;
+  }
+
+  async update(claims: AccessTokenClaims, id: string, dto: UpdateRouteDto): Promise<Route> {
+    const schoolId = requireSchoolId(claims);
+    const repository = this.tenantContextService.getManager().getRepository(Route);
+
+    const existing = await repository.findOne({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException('Route not found');
+    }
+
+    await this.assertVehicleExists(dto.defaultVehicleId);
+    await this.assertUserHasRole(dto.defaultDriverUserId, 'driver', 'defaultDriverUserId');
+    await this.assertUserHasRole(
+      dto.defaultAttendantUserId,
+      'attendant',
+      'defaultAttendantUserId',
+    );
+
+    const patch: Partial<Route> = {};
+    if (dto.name !== undefined) patch.name = dto.name;
+    if (dto.description !== undefined) patch.description = dto.description;
+    if (dto.defaultVehicleId !== undefined) patch.defaultVehicleId = dto.defaultVehicleId;
+    if (dto.defaultDriverUserId !== undefined) {
+      patch.defaultDriverUserId = dto.defaultDriverUserId;
+    }
+    if (dto.defaultAttendantUserId !== undefined) {
+      patch.defaultAttendantUserId = dto.defaultAttendantUserId;
+    }
+    if (dto.status !== undefined) patch.status = dto.status;
+
+    const updated = await repository.save({ ...existing, ...patch });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'route.updated',
+      entityType: 'route',
+      entityId: updated.id,
+    });
+
+    return updated;
+  }
+}
+```
+
+`assertUserHasRole` and `assertVehicleExists` both return early on a null or absent value, so clearing a default (`defaultDriverUserId: null`) is allowed while setting a bad one is not.
+
+- [ ] **Step 5: Write the controller and module**
+
+`apps/api/src/transport/routes/routes.controller.ts` follows Task 10's shape, with per-handler roles rather than a class-level decorator, because reads and writes differ:
+
+```ts
+  @Roles('school_admin')
+  @Post()                                    // create
+  @Roles('school_admin', 'driver', 'attendant')
+  @Get()                                     // findAll — scoped in the service
+  @Roles('school_admin', 'driver', 'attendant')
+  @Get(':id')                                // findOne — scoped in the service
+  @Roles('school_admin')
+  @Patch(':id')                              // update
+```
+
+Handler bodies mirror `VehiclesController` exactly, substituting `RoutesService`, the route DTOs and `toRouteResponse`, with `ParseUUIDPipe` on `:id`.
+
+`apps/api/src/transport/routes/routes.module.ts` imports `AuthModule` and `AuditModule`, declares `RoutesController`, provides `RoutesService`, and exports `RoutesService` — Task 14 consumes it.
+
+- [ ] **Step 6: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- routes.service`
+Expected: PASS, 8 tests.
+
+- [ ] **Step 7: Prove the driver scoping bites**
+
+Temporarily make `scopeFor` return `{}` for every role, and re-run. "Shows a driver only the routes they drive" and "refuses a driver reading a route they do not drive" must both **fail**. Restore, confirm they pass, and record both outputs.
+
+- [ ] **Step 8: Run the full suite and commit**
+
+```bash
+git add apps/api/src/transport/routes/
+git commit -m "feat: add routes module with role-checked defaults and driver scoping"
+```
+
+---
+
+### Task 13: `PUT /routes/:id/stops` — atomic stop replacement
+
+**Files:**
+- Create: `apps/api/src/transport/routes/route-stops.service.ts`
+- Create: `apps/api/src/transport/routes/dto/replace-route-stops.dto.ts`
+- Create: `apps/api/src/transport/routes/dto/route-stop-response.dto.ts`
+- Modify: `apps/api/src/transport/routes/routes.controller.ts` — add `PUT /routes/:id/stops` and `GET /routes/:id/stops`
+- Modify: `apps/api/src/transport/routes/routes.module.ts` — provide and export `RouteStopsService`
+- Test: `apps/api/src/transport/routes/route-stops.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `RouteStop` (Task 4), `Stop` (Task 3), `Route` (Task 4); `RoutesService.findById` for the route-scope check; `requireSchoolId`; `TenantContextService`, `AuditService`.
+- Produces: `RouteStopsService` with `replace(claims, routeId, dto): Promise<RouteStop[]>` and `list(claims, routeId): Promise<RouteStop[]>`; `ReplaceRouteStopsDto` and its nested `RouteStopItemDto`; `RouteStopResponseDto` + `toRouteStopResponse`.
+
+**Why replacement rather than per-row editing.** `route_stops` carries UNIQUE `(route_id, sequence)` and UNIQUE `(route_id, stop_id)`. Reordering two stops through individual updates transiently violates the first constraint no matter which order the updates run in, and a client-driven sequence of insert/update/delete calls cannot be made atomic across HTTP requests. A half-applied reorder leaves a route with duplicate or missing positions — a route that no longer describes a real journey. So the whole ordered set is replaced in one statement pair inside one transaction: delete all, insert all.
+
+The transaction is the one the `TenancyInterceptor` already opened for the request. **Do not open a nested transaction or reach for the `DataSource`** — `getManager()` returns the request's transactional manager, and everything issued through it is already atomic with the audit write.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/routes/route-stops.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { RoutesService } from './routes.service';
+import { RouteStopsService } from './route-stops.service';
+
+describe('RouteStopsService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: RouteStopsService;
+
+  let schoolId: string;
+  let adminId: string;
+  let routeId: string;
+  let otherRouteId: string;
+  let stopA: string;
+  let stopB: string;
+  let stopC: string;
+
+  const adminClaims = (): AccessTokenClaims => ({
+    sub: adminId,
+    schoolId,
+    role: 'school_admin',
+    isSuperAdmin: false,
+  });
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  const sequences = async (route: string): Promise<{ stop_id: string; sequence: number }[]> =>
+    asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(
+          `SELECT stop_id, sequence FROM transport.route_stops WHERE route_id = $1 ORDER BY sequence`,
+          [route],
+        ),
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    const auditService = new AuditService(tenantContextService);
+    service = new RouteStopsService(
+      tenantContextService,
+      auditService,
+      new RoutesService(tenantContextService, auditService),
+    );
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Route Stops School') RETURNING id`,
+      );
+      schoolId = school.id;
+
+      const [admin] = await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'school_admin', $2, 'x', 'Admin') RETURNING id`,
+        [schoolId, `route-stops-admin-${randomUUID()}@example.com`],
+      );
+      adminId = admin.id;
+
+      const insertRoute = async (name: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO transport.routes (school_id, name, status) VALUES ($1, $2, 'active') RETURNING id`,
+          [schoolId, name],
+        );
+        return row.id;
+      };
+      routeId = await insertRoute('Route A');
+      otherRouteId = await insertRoute('Route B');
+
+      const insertStop = async (name: string, lat: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO transport.stops (school_id, name, latitude, longitude, geofence_radius_m)
+           VALUES ($1, $2, $3, '76.300000', 150) RETURNING id`,
+          [schoolId, name, lat],
+        );
+        return row.id;
+      };
+      stopA = await insertStop('Stop A', '10.010000');
+      stopB = await insertStop('Stop B', '10.020000');
+      stopC = await insertStop('Stop C', '10.030000');
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('writes the ordered set and audits the replacement once', async () => {
+    const result = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.replace(adminClaims(), routeId, {
+        stops: [
+          { stopId: stopA, expectedOffsetMinutes: 0 },
+          { stopId: stopB, expectedOffsetMinutes: 12 },
+        ],
+      }),
+    );
+
+    expect(result.map((row) => row.sequence)).toEqual([1, 2]);
+    expect(await sequences(routeId)).toEqual([
+      { stop_id: stopA, sequence: 1 },
+      { stop_id: stopB, sequence: 2 },
+    ]);
+
+    const audits = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action, entity_id FROM audit.audit_logs WHERE entity_id = $1`, [routeId]),
+    );
+    expect(audits).toEqual([{ action: 'route.stops_replaced', entity_id: routeId }]);
+  });
+
+  it('reverses an order that would collide if applied row by row', async () => {
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.replace(adminClaims(), routeId, {
+        stops: [
+          { stopId: stopB, expectedOffsetMinutes: 0 },
+          { stopId: stopA, expectedOffsetMinutes: 15 },
+        ],
+      }),
+    );
+
+    expect(await sequences(routeId)).toEqual([
+      { stop_id: stopB, sequence: 1 },
+      { stop_id: stopA, sequence: 2 },
+    ]);
+  });
+
+  it('leaves the existing sequence intact when the replacement fails partway', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.replace(adminClaims(), routeId, {
+          stops: [
+            { stopId: stopC, expectedOffsetMinutes: 0 },
+            { stopId: randomUUID(), expectedOffsetMinutes: 10 },
+          ],
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    // The valid first entry must not have survived the rejected call.
+    expect(await sequences(routeId)).toEqual([
+      { stop_id: stopB, sequence: 1 },
+      { stop_id: stopA, sequence: 2 },
+    ]);
+  });
+
+  it('rejects a repeated stop within one replacement', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.replace(adminClaims(), routeId, {
+          stops: [
+            { stopId: stopA, expectedOffsetMinutes: 0 },
+            { stopId: stopA, expectedOffsetMinutes: 10 },
+          ],
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects offsets that do not increase along the route', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.replace(adminClaims(), routeId, {
+          stops: [
+            { stopId: stopA, expectedOffsetMinutes: 20 },
+            { stopId: stopB, expectedOffsetMinutes: 5 },
+          ],
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('accepts an empty list, clearing the route', async () => {
+    const result = await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.replace(adminClaims(), routeId, { stops: [] }),
+    );
+
+    expect(result).toEqual([]);
+    expect(await sequences(routeId)).toEqual([]);
+  });
+
+  it('does not touch another route', async () => {
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.replace(adminClaims(), otherRouteId, {
+        stops: [{ stopId: stopC, expectedOffsetMinutes: 0 }],
+      }),
+    );
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.replace(adminClaims(), routeId, {
+        stops: [{ stopId: stopA, expectedOffsetMinutes: 0 }],
+      }),
+    );
+
+    expect(await sequences(otherRouteId)).toEqual([{ stop_id: stopC, sequence: 1 }]);
+  });
+
+  it('raises NotFound for a route that does not exist', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.replace(adminClaims(), randomUUID(), { stops: [] }),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+The third test is the atomicity proof, and it only proves anything because the invalid stop is **second**. A validation pass that ran before any write would pass this test trivially; the test is written so that a naive implementation which validates and inserts per row would leave `stopC` at sequence 1 and fail the assertion. Implement the validation loop first and the write second — but keep this test, because it is what stops a later refactor from interleaving them.
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- route-stops.service`
+Expected: FAIL — `Cannot find module './route-stops.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/routes/dto/replace-route-stops.dto.ts`:
+```ts
+import { Type } from 'class-transformer';
+import { ArrayMaxSize, IsArray, IsInt, IsUUID, Max, Min, ValidateNested } from 'class-validator';
+
+export class RouteStopItemDto {
+  @IsUUID()
+  stopId: string;
+
+  // Minutes from the start of the route. Zero is valid — the first stop is
+  // usually the route's origin.
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(600)
+  expectedOffsetMinutes: number;
+}
+
+export class ReplaceRouteStopsDto {
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => RouteStopItemDto)
+  stops: RouteStopItemDto[];
+}
+```
+
+`@Type(() => RouteStopItemDto)` is required, not decorative: without it `class-transformer` leaves the array as plain objects and `@ValidateNested` silently validates nothing. That is the same class of failure as a test that cannot fail, and it is why the DTO-level rules here are backed by service-level checks that the tests exercise directly.
+
+The sequence numbers are **not** in the DTO. They are the array's index plus one. Accepting client-supplied sequences would invite gaps and duplicates that the unique constraint would then reject with a database error rather than a clear message.
+
+`apps/api/src/transport/routes/dto/route-stop-response.dto.ts`:
+```ts
+import { RouteStop } from '../../../entities/route-stop.entity';
+
+export interface RouteStopResponseDto {
+  id: string;
+  routeId: string;
+  stopId: string;
+  sequence: number;
+  expectedOffsetMinutes: number;
+}
+
+export function toRouteStopResponse(routeStop: RouteStop): RouteStopResponseDto {
+  return {
+    id: routeStop.id,
+    routeId: routeStop.routeId,
+    stopId: routeStop.stopId,
+    sequence: routeStop.sequence,
+    expectedOffsetMinutes: routeStop.expectedOffsetMinutes,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/routes/route-stops.service.ts`:
+```ts
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { In } from 'typeorm';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { RouteStop } from '../../entities/route-stop.entity';
+import { Stop } from '../../entities/stop.entity';
+import { requireSchoolId } from '../students/students.service';
+import { RoutesService } from './routes.service';
+import { ReplaceRouteStopsDto } from './dto/replace-route-stops.dto';
+
+@Injectable()
+export class RouteStopsService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+    private readonly routesService: RoutesService,
+  ) {}
+
+  async list(claims: AccessTokenClaims, routeId: string): Promise<RouteStop[]> {
+    // Raises NotFound for a route outside the caller's scope, so a driver
+    // cannot read the composition of someone else's route.
+    await this.routesService.findById(claims, routeId);
+
+    return this.tenantContextService
+      .getManager()
+      .getRepository(RouteStop)
+      .find({ where: { routeId }, order: { sequence: 'ASC' } });
+  }
+
+  /**
+   * Replaces a route's entire ordered stop list.
+   *
+   * Every check runs before the first write. That ordering is the whole point:
+   * `route_stops` carries UNIQUE (route_id, sequence) and UNIQUE
+   * (route_id, stop_id), so a per-row apply would both collide on a reorder and
+   * leave a partially rewritten route behind if a later row turned out invalid.
+   * Delete-all-then-insert-all inside the request transaction cannot do either.
+   */
+  async replace(
+    claims: AccessTokenClaims,
+    routeId: string,
+    dto: ReplaceRouteStopsDto,
+  ): Promise<RouteStop[]> {
+    const schoolId = requireSchoolId(claims);
+    await this.routesService.findById(claims, routeId);
+
+    const stopIds = dto.stops.map((item) => item.stopId);
+
+    const duplicate = stopIds.find((id, index) => stopIds.indexOf(id) !== index);
+    if (duplicate) {
+      throw new BadRequestException(`Stop ${duplicate} appears more than once on this route`);
+    }
+
+    for (let index = 1; index < dto.stops.length; index += 1) {
+      const previous = dto.stops[index - 1];
+      const current = dto.stops[index];
+      if (current.expectedOffsetMinutes <= previous.expectedOffsetMinutes) {
+        throw new BadRequestException(
+          `expectedOffsetMinutes must increase along the route: position ${index + 1} ` +
+            `(${current.expectedOffsetMinutes}) is not after position ${index} ` +
+            `(${previous.expectedOffsetMinutes})`,
+        );
+      }
+    }
+
+    const manager = this.tenantContextService.getManager();
+
+    if (stopIds.length > 0) {
+      // RLS confines this lookup to the caller's school, so a stop belonging to
+      // another tenant reads as missing rather than as a cross-tenant leak.
+      const found = await manager.getRepository(Stop).find({
+        where: { id: In(stopIds) },
+        select: { id: true },
+      });
+      const foundIds = new Set(found.map((stop) => stop.id));
+      const missing = stopIds.filter((id) => !foundIds.has(id));
+      if (missing.length > 0) {
+        throw new BadRequestException(
+          `These stops do not exist in this school: ${missing.join(', ')}`,
+        );
+      }
+    }
+
+    const repository = manager.getRepository(RouteStop);
+    await repository.delete({ routeId });
+
+    if (dto.stops.length === 0) {
+      await this.recordReplacement(schoolId, claims, routeId, 0);
+      return [];
+    }
+
+    const inserted = await repository.save(
+      dto.stops.map((item, index) => ({
+        schoolId,
+        routeId,
+        stopId: item.stopId,
+        sequence: index + 1,
+        expectedOffsetMinutes: item.expectedOffsetMinutes,
+      })),
+    );
+
+    await this.recordReplacement(schoolId, claims, routeId, inserted.length);
+
+    return [...inserted].sort((left, right) => left.sequence - right.sequence);
+  }
+
+  private async recordReplacement(
+    schoolId: string,
+    claims: AccessTokenClaims,
+    routeId: string,
+    stopCount: number,
+  ): Promise<void> {
+    // One audit row for the operation, not one per stop: replacing the list is
+    // a single decision by a single person, and an operator reading the log
+    // wants to see that decision rather than reconstruct it from N rows.
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'route.stops_replaced',
+      entityType: 'route',
+      entityId: routeId,
+      metadata: { stopCount },
+    });
+  }
+}
+```
+
+`repository.save` with an array issues a multi-row insert and returns the saved rows, but TypeORM does not guarantee their order matches the input, so the return is sorted by `sequence` explicitly rather than trusted.
+
+- [ ] **Step 5: Wire the endpoints and the module**
+
+Add to `routes.controller.ts` — constructor gains `private readonly routeStopsService: RouteStopsService`:
+
+```ts
+  @Roles('school_admin')
+  @Put(':id/stops')
+  async replaceStops(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ReplaceRouteStopsDto,
+  ): Promise<RouteStopResponseDto[]> {
+    const stops = await this.routeStopsService.replace(user, id, dto);
+    return stops.map(toRouteStopResponse);
+  }
+
+  @Roles('school_admin', 'driver', 'attendant')
+  @Get(':id/stops')
+  async listStops(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<RouteStopResponseDto[]> {
+    const stops = await this.routeStopsService.list(user, id);
+    return stops.map(toRouteStopResponse);
+  }
+```
+
+Import `Put` from `@nestjs/common`, plus `RouteStopsService`, `ReplaceRouteStopsDto`, `RouteStopResponseDto` and `toRouteStopResponse`. `GET /routes/:id/stops` is not in the spec's endpoint table but is the read half of a `PUT` that would otherwise be write-only — a driver has to be able to see the stops on their route, and the scope check on `list` is the same one `findById` applies.
+
+These two lists are deliberately not paginated. A route has tens of stops, the ordering is the payload's meaning, and paging it would let a client render half a journey.
+
+Then add `RouteStopsService` to `providers` and `exports` in `routes.module.ts`.
+
+- [ ] **Step 6: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- route-stops.service`
+Expected: PASS, 8 tests.
+
+- [ ] **Step 7: Prove the atomicity test bites**
+
+Temporarily move the stop-existence check so it runs *inside* the insert loop, one row at a time, and re-run. "Leaves the existing sequence intact when the replacement fails partway" must **fail**. Restore, confirm it passes, and record both outputs.
+
+- [ ] **Step 8: Run the full suite and commit**
+
+```bash
+git add apps/api/src/transport/routes/
+git commit -m "feat: replace route stop sequences atomically in one transaction"
+```

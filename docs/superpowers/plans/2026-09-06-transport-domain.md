@@ -1374,3 +1374,306 @@ git add apps/api/src/database/migrations/1757031000000-CreateStudentRouteAssignm
         apps/api/src/entities/student-route-assignment.entity.ts
 git commit -m "feat: add student_route_assignments with date ranges and tenant RLS"
 ```
+
+---
+
+### Task 6: `AbacScopeService` — the role-attribute access layer
+
+**Files:**
+- Create: `apps/api/src/transport/abac/abac-scope.service.ts`
+- Test: `apps/api/src/transport/abac/abac-scope.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `TenantContextService.getManager()` from `src/tenancy/tenant-context.service`; `AccessTokenClaims` from `src/auth/token.service`; entities `StudentGuardian`, `Route`, `StudentRouteAssignment`.
+- Produces: `AbacScopeService` with two methods that every later task depends on:
+  - `visibleStudentIds(claims: AccessTokenClaims): Promise<StudentScope>` where `type StudentScope = { kind: 'all' } | { kind: 'restricted'; studentIds: string[] }`
+  - `assertCanReadStudent(claims: AccessTokenClaims, studentId: string): Promise<void>` — throws `ForbiddenException` when out of scope.
+
+**Why this task exists, and why it is separate.** Foundations' Row-Level Security is a *tenant* boundary and never a role boundary: `users_tenant_all` is `FOR ALL`, so at the database layer any authenticated session already has full rights over its own school's rows. Every `transport` table follows that same pattern. So RLS alone would let a **parent see every student in their school**. This service is the only thing standing between a parent and another family's children, and it is deliberately in one file so that rule can be read and tested in one place rather than re-derived in each module.
+
+`{ kind: 'all' }` and `{ kind: 'restricted' }` are distinguished rather than returning a plain array, because "no restriction" and "restricted to an empty set" must not be confused. A parent with no linked children sees nothing; a school_admin sees everything. Collapsing both to `string[]` makes the empty array ambiguous and is exactly the kind of silent widening this layer exists to prevent.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/abac/abac-scope.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { ForbiddenException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { AbacScopeService } from './abac-scope.service';
+
+describe('AbacScopeService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: AbacScopeService;
+
+  let schoolId: string;
+  let ownChild: string;
+  let otherChild: string;
+  let parentId: string;
+  let driverId: string;
+
+  const claimsFor = (role: AccessTokenClaims['role'], sub: string): AccessTokenClaims => ({
+    sub,
+    schoolId,
+    role,
+    isSuperAdmin: role === 'super_admin',
+  });
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    service = new AbacScopeService(tenantContextService);
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const runId = randomUUID();
+
+      const [school] = (await manager.query(
+        `INSERT INTO core.schools (name) VALUES ($1) RETURNING id`,
+        [`ABAC-${runId}`],
+      )) as { id: string }[];
+      schoolId = school.id;
+
+      const [parent] = (await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'parent', $2, 'x', 'Parent') RETURNING id`,
+        [schoolId, `abac-parent-${runId}@example.com`],
+      )) as { id: string }[];
+      parentId = parent.id;
+
+      const [driver] = (await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'driver', $2, 'x', 'Driver') RETURNING id`,
+        [schoolId, `abac-driver-${runId}@example.com`],
+      )) as { id: string }[];
+      driverId = driver.id;
+
+      const [own] = (await manager.query(
+        `INSERT INTO transport.students (school_id, admission_number, full_name, grade)
+         VALUES ($1, $2, 'Own Child', '5') RETURNING id`,
+        [schoolId, `OWN-${runId}`],
+      )) as { id: string }[];
+      ownChild = own.id;
+
+      const [other] = (await manager.query(
+        `INSERT INTO transport.students (school_id, admission_number, full_name, grade)
+         VALUES ($1, $2, 'Other Child', '5') RETURNING id`,
+        [schoolId, `OTHER-${runId}`],
+      )) as { id: string }[];
+      otherChild = other.id;
+
+      // Only ownChild is linked to the parent. otherChild is in the SAME school,
+      // so RLS alone would expose it — that is the point of these tests.
+      await manager.query(
+        `INSERT INTO transport.student_guardians (school_id, student_id, guardian_user_id, relationship)
+         VALUES ($1, $2, $3, 'mother')`,
+        [schoolId, ownChild, parentId],
+      );
+
+      const [route] = (await manager.query(
+        `INSERT INTO transport.routes (school_id, name, default_driver_user_id)
+         VALUES ($1, $2, $3) RETURNING id`,
+        [schoolId, `ABAC-Route-${runId}`, driverId],
+      )) as { id: string }[];
+
+      const [stop] = (await manager.query(
+        `INSERT INTO transport.stops (school_id, name, latitude, longitude)
+         VALUES ($1, $2, 10.02, 76.30) RETURNING id`,
+        [schoolId, `ABAC-Stop-${runId}`],
+      )) as { id: string }[];
+
+      // Only ownChild rides the driver's route.
+      await manager.query(
+        `INSERT INTO transport.student_route_assignments
+           (school_id, student_id, route_id, stop_id, direction, effective_from)
+         VALUES ($1, $2, $3, $4, 'both', CURRENT_DATE)`,
+        [schoolId, ownChild, route.id, stop.id],
+      );
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource?.destroy();
+  });
+
+  const inTenant = <T>(claims: AccessTokenClaims, work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(claims, work);
+
+  it('places no restriction on a school_admin', async () => {
+    const claims = claimsFor('school_admin', randomUUID());
+    const scope = await inTenant(claims, () => service.visibleStudentIds(claims));
+    expect(scope).toEqual({ kind: 'all' });
+  });
+
+  it('places no restriction on a super_admin', async () => {
+    const claims: AccessTokenClaims = { sub: randomUUID(), schoolId: null, role: 'super_admin', isSuperAdmin: true };
+    const scope = await inTenant(claims, () => service.visibleStudentIds(claims));
+    expect(scope).toEqual({ kind: 'all' });
+  });
+
+  it('restricts a parent to their linked children only', async () => {
+    const claims = claimsFor('parent', parentId);
+    const scope = await inTenant(claims, () => service.visibleStudentIds(claims));
+
+    expect(scope.kind).toBe('restricted');
+    if (scope.kind !== 'restricted') throw new Error('expected a restricted scope');
+    expect(scope.studentIds).toEqual([ownChild]);
+    // The decisive assertion: another child in the SAME school is excluded.
+    expect(scope.studentIds).not.toContain(otherChild);
+  });
+
+  it('restricts a driver to students on the routes they drive', async () => {
+    const claims = claimsFor('driver', driverId);
+    const scope = await inTenant(claims, () => service.visibleStudentIds(claims));
+
+    expect(scope.kind).toBe('restricted');
+    if (scope.kind !== 'restricted') throw new Error('expected a restricted scope');
+    expect(scope.studentIds).toEqual([ownChild]);
+    expect(scope.studentIds).not.toContain(otherChild);
+  });
+
+  it('gives a parent with no linked children an empty restricted scope, not unrestricted access', async () => {
+    const claims = claimsFor('parent', randomUUID());
+    const scope = await inTenant(claims, () => service.visibleStudentIds(claims));
+
+    expect(scope).toEqual({ kind: 'restricted', studentIds: [] });
+  });
+
+  it('allows a parent to read their own child', async () => {
+    const claims = claimsFor('parent', parentId);
+    await expect(inTenant(claims, () => service.assertCanReadStudent(claims, ownChild))).resolves.toBeUndefined();
+  });
+
+  it('forbids a parent from reading another family child in the same school', async () => {
+    const claims = claimsFor('parent', parentId);
+    await expect(inTenant(claims, () => service.assertCanReadStudent(claims, otherChild))).rejects.toThrow(
+      ForbiddenException,
+    );
+  });
+});
+```
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- abac-scope`
+Expected: FAIL — `Cannot find module './abac-scope.service'`.
+
+- [ ] **Step 3: Write the service**
+
+`apps/api/src/transport/abac/abac-scope.service.ts`:
+```ts
+import { ForbiddenException, Injectable } from '@nestjs/common';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+
+/**
+ * Which students a caller may see.
+ *
+ * `all` and `restricted` are distinguished rather than collapsed into an array
+ * because "no restriction" and "restricted to nothing" are opposite outcomes.
+ * A parent with no linked children must see nothing; a school_admin sees
+ * everything. If both were `string[]`, an empty array would be ambiguous and a
+ * caller that treated "empty means unfiltered" would silently expose the whole
+ * school.
+ */
+export type StudentScope = { kind: 'all' } | { kind: 'restricted'; studentIds: string[] };
+
+@Injectable()
+export class AbacScopeService {
+  constructor(private readonly tenantContextService: TenantContextService) {}
+
+  /**
+   * Row-Level Security already confines every query to the caller's school.
+   * This narrows further, by role attribute, to the students that role may see
+   * *within* that school — the layer RLS deliberately does not provide.
+   */
+  async visibleStudentIds(claims: AccessTokenClaims): Promise<StudentScope> {
+    if (claims.isSuperAdmin || claims.role === 'school_admin') {
+      return { kind: 'all' };
+    }
+
+    const manager = this.tenantContextService.getManager();
+
+    if (claims.role === 'parent') {
+      const rows = (await manager.query(
+        `SELECT student_id FROM transport.student_guardians WHERE guardian_user_id = $1 ORDER BY student_id`,
+        [claims.sub],
+      )) as { student_id: string }[];
+      return { kind: 'restricted', studentIds: rows.map((row) => row.student_id) };
+    }
+
+    if (claims.role === 'driver' || claims.role === 'attendant') {
+      const column =
+        claims.role === 'driver' ? 'default_driver_user_id' : 'default_attendant_user_id';
+      const rows = (await manager.query(
+        `SELECT DISTINCT a.student_id
+           FROM transport.student_route_assignments a
+           JOIN transport.routes r ON r.id = a.route_id
+          WHERE r.${column} = $1
+            AND a.effective_from <= CURRENT_DATE
+            AND (a.effective_to IS NULL OR a.effective_to >= CURRENT_DATE)
+          ORDER BY a.student_id`,
+        [claims.sub],
+      )) as { student_id: string }[];
+      return { kind: 'restricted', studentIds: rows.map((row) => row.student_id) };
+    }
+
+    // Any role not enumerated above sees nothing. Failing closed matters more
+    // than convenience: a role added later must be considered deliberately
+    // rather than inheriting access by omission.
+    return { kind: 'restricted', studentIds: [] };
+  }
+
+  async assertCanReadStudent(claims: AccessTokenClaims, studentId: string): Promise<void> {
+    const scope = await this.visibleStudentIds(claims);
+    if (scope.kind === 'all') {
+      return;
+    }
+    if (!scope.studentIds.includes(studentId)) {
+      throw new ForbiddenException('Student is not within your access scope');
+    }
+  }
+}
+```
+
+Two details that are load-bearing rather than stylistic:
+
+The `column` value is chosen by a closed ternary over two literals, never interpolated from anything caller-supplied — the only safe way to vary an identifier in SQL, since Postgres offers no parameter binding for column names.
+
+The driver query filters on the assignment's date range. A driver must see the students riding their route **today**, not everyone who ever rode it. Omitting the date predicate would quietly widen a driver's view to every student ever assigned, which is precisely the kind of drift the date columns exist to prevent.
+
+- [ ] **Step 4: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- abac-scope`
+Expected: PASS, 7 tests.
+
+- [ ] **Step 5: Prove the tests bite**
+
+This is the most important verification in the sub-project. Temporarily change `visibleStudentIds` so the `parent` branch returns `{ kind: 'all' }`, then re-run the focused suite. Expect the parent-restriction test and the `assertCanReadStudent` forbidden test to **fail**. Restore the correct code and confirm they pass again.
+
+Record both outputs in your report. A scoping test that would still pass with the scoping removed is worse than no test, because it looks like protection — and that exact failure mode was found repeatedly during Foundations.
+
+- [ ] **Step 6: Run the full suite and commit**
+
+Run the full suite twice; both green. Then:
+
+```bash
+git add apps/api/src/transport/abac/abac-scope.service.ts \
+        apps/api/src/transport/abac/abac-scope.service.spec.ts
+git commit -m "feat: add ABAC scope service narrowing student visibility by role"
+```

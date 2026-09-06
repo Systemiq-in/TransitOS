@@ -31,5 +31,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm --filter @transitos/api db:bootstrap
+      - run: pnpm --filter @transitos/api migration:run
       - run: pnpm test
       - run: pnpm --filter @transitos/api test:e2e

@@ -1677,3 +1677,1200 @@ git add apps/api/src/transport/abac/abac-scope.service.ts \
         apps/api/src/transport/abac/abac-scope.service.spec.ts
 git commit -m "feat: add ABAC scope service narrowing student visibility by role"
 ```
+
+---
+
+### Task 7: `StudentsService` and its DTOs
+
+**Files:**
+- Create: `apps/api/src/transport/students/students.service.ts`
+- Create: `apps/api/src/transport/students/dto/create-student.dto.ts`
+- Create: `apps/api/src/transport/students/dto/update-student.dto.ts`
+- Create: `apps/api/src/transport/students/dto/student-response.dto.ts`
+- Test: `apps/api/src/transport/students/students.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `TenantContextService.getManager()`; `AuditService.record()`; `AbacScopeService.visibleStudentIds` / `assertCanReadStudent` (Task 6); the `Student` entity and `StudentStatus` type (Task 1); `AccessTokenClaims`.
+- Produces:
+  - `StudentsService` with `create(claims, dto): Promise<Student>`, `findById(claims, id): Promise<Student>`, `findAll(claims, limit, offset): Promise<Page<Student>>`, `update(claims, id, dto): Promise<Student>`
+  - `interface Page<T> { items: T[]; total: number }` — the same shape `SchoolsService` exports, redeclared here so the transport modules do not import from `src/schools/`
+  - `CreateStudentDto`, `UpdateStudentDto`, `StudentResponseDto`, `toStudentResponse(student: Student): StudentResponseDto`
+
+**Why the service and not the controller owns scoping.** The controller decides *which roles may call an endpoint*; the service decides *which rows that caller may see*. Keeping the second decision in the service means Task 14's assignment endpoints get the same narrowing for free instead of re-implementing it, and it means the scoping tests can run without an HTTP layer.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/students/students.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { AbacScopeService } from '../abac/abac-scope.service';
+import { StudentsService } from './students.service';
+
+describe('StudentsService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let service: StudentsService;
+
+  let schoolId: string;
+  let otherSchoolId: string;
+  let adminId: string;
+  let parentId: string;
+  let ownChildId: string;
+
+  const admissionNumber = `ADM-${randomUUID().slice(0, 8)}`;
+
+  const claimsFor = (
+    role: AccessTokenClaims['role'],
+    sub: string,
+    school: string = schoolId,
+  ): AccessTokenClaims => ({
+    sub,
+    schoolId: school,
+    role,
+    isSuperAdmin: false,
+  });
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    service = new StudentsService(
+      tenantContextService,
+      new AuditService(tenantContextService),
+      new AbacScopeService(tenantContextService),
+    );
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Students Service School') RETURNING id`,
+      );
+      const [other] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Students Service Other School') RETURNING id`,
+      );
+      schoolId = school.id;
+      otherSchoolId = other.id;
+
+      const [admin] = await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'school_admin', $2, 'x', 'Admin') RETURNING id`,
+        [schoolId, `students-admin-${randomUUID()}@example.com`],
+      );
+      const [parent] = await manager.query(
+        `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+         VALUES ($1, 'parent', $2, 'x', 'Parent') RETURNING id`,
+        [schoolId, `students-parent-${randomUUID()}@example.com`],
+      );
+      adminId = admin.id;
+      parentId = parent.id;
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('creates a student and audits the creation', async () => {
+    const created = await tenantContextService.runWithTenant(
+      claimsFor('school_admin', adminId),
+      () =>
+        service.create(claimsFor('school_admin', adminId), {
+          admissionNumber,
+          fullName: 'Aarav Nair',
+          grade: '5',
+          section: 'B',
+        }),
+    );
+
+    expect(created.id).toBeDefined();
+    expect(created.status).toBe('active');
+    expect(created.section).toBe('B');
+    expect(created.dateOfBirth).toBeNull();
+    ownChildId = created.id;
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(
+          `SELECT action, entity_type, entity_id, actor_user_id, school_id
+             FROM audit.audit_logs WHERE entity_id = $1`,
+          [created.id],
+        ),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: 'student.created',
+      entity_type: 'student',
+      entity_id: created.id,
+      actor_user_id: adminId,
+      school_id: schoolId,
+    });
+  });
+
+  it('rejects a duplicate admission number within the same school', async () => {
+    await expect(
+      tenantContextService.runWithTenant(claimsFor('school_admin', adminId), () =>
+        service.create(claimsFor('school_admin', adminId), {
+          admissionNumber,
+          fullName: 'Impostor',
+          grade: '5',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('accepts the same admission number in a different school', async () => {
+    const [otherAdmin] = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(
+          `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+           VALUES ($1, 'school_admin', $2, 'x', 'Other Admin') RETURNING id`,
+          [otherSchoolId, `students-other-admin-${randomUUID()}@example.com`],
+        ),
+    );
+
+    const created = await tenantContextService.runWithTenant(
+      claimsFor('school_admin', otherAdmin.id, otherSchoolId),
+      () =>
+        service.create(claimsFor('school_admin', otherAdmin.id, otherSchoolId), {
+          admissionNumber,
+          fullName: 'Same Number Elsewhere',
+          grade: '5',
+        }),
+    );
+
+    expect(created.schoolId).toBe(otherSchoolId);
+  });
+
+  it('lists every student in the school for a school_admin', async () => {
+    const page = await tenantContextService.runWithTenant(
+      claimsFor('school_admin', adminId),
+      () => service.findAll(claimsFor('school_admin', adminId), 50, 0),
+    );
+
+    expect(page.total).toBeGreaterThanOrEqual(1);
+    expect(page.items.map((student) => student.id)).toContain(ownChildId);
+  });
+
+  it('lists nothing for a parent with no linked children', async () => {
+    const page = await tenantContextService.runWithTenant(claimsFor('parent', parentId), () =>
+      service.findAll(claimsFor('parent', parentId), 50, 0),
+    );
+
+    expect(page).toEqual({ items: [], total: 0 });
+  });
+
+  it('refuses to read a student outside the caller scope', async () => {
+    await expect(
+      tenantContextService.runWithTenant(claimsFor('parent', parentId), () =>
+        service.findById(claimsFor('parent', parentId), ownChildId),
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('updates a student and audits the update', async () => {
+    const updated = await tenantContextService.runWithTenant(
+      claimsFor('school_admin', adminId),
+      () =>
+        service.update(claimsFor('school_admin', adminId), ownChildId, { grade: '6', section: null }),
+    );
+
+    expect(updated.grade).toBe('6');
+    expect(updated.section).toBeNull();
+    expect(updated.admissionNumber).toBe(admissionNumber);
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1 ORDER BY created_at`, [
+          ownChildId,
+        ]),
+    );
+    expect(rows.map((row: { action: string }) => row.action)).toEqual([
+      'student.created',
+      'student.updated',
+    ]);
+  });
+
+  it('audits a status change to inactive as a deactivation, not an update', async () => {
+    await tenantContextService.runWithTenant(claimsFor('school_admin', adminId), () =>
+      service.update(claimsFor('school_admin', adminId), ownChildId, { status: 'inactive' }),
+    );
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE entity_id = $1 ORDER BY created_at`, [
+          ownChildId,
+        ]),
+    );
+    expect(rows.map((row: { action: string }) => row.action)).toEqual([
+      'student.created',
+      'student.updated',
+      'student.deactivated',
+    ]);
+  });
+
+  it('raises NotFound when updating a student that does not exist', async () => {
+    await expect(
+      tenantContextService.runWithTenant(claimsFor('school_admin', adminId), () =>
+        service.update(claimsFor('school_admin', adminId), randomUUID(), { grade: '9' }),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+Note the shape of the duplicate-admission-number test. It runs the failing `create` inside its **own** `runWithTenant`, not appended to the successful one. A unique violation aborts the enclosing Postgres transaction, so every subsequent statement in that transaction fails with `current transaction is aborted`. Sharing one transaction between the success and the conflict would produce a passing test for the wrong reason.
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- students.service`
+Expected: FAIL — `Cannot find module './students.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/students/dto/create-student.dto.ts`:
+```ts
+import { IsISO8601, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+
+export class CreateStudentDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  admissionNumber: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
+  fullName: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(32)
+  grade: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  section?: string;
+
+  // A date-only ISO string. The column is `date`, and TypeORM hands `date`
+  // columns back as strings, so keeping the DTO a string avoids a timezone
+  // round-trip that could shift a birthday by a day.
+  @IsOptional()
+  @IsISO8601()
+  dateOfBirth?: string;
+}
+```
+
+`apps/api/src/transport/students/dto/update-student.dto.ts`:
+```ts
+import { IsIn, IsISO8601, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { StudentStatus } from '../../../entities/student.entity';
+
+// `admissionNumber` is deliberately absent. It is the school's own key for the
+// child and appears on records this system does not own; changing it through a
+// PATCH would silently break the correspondence. A genuine correction is rare
+// enough to be worth its own endpoint later.
+export class UpdateStudentDto {
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
+  fullName?: string;
+
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(32)
+  grade?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  section?: string | null;
+
+  @IsOptional()
+  @IsISO8601()
+  dateOfBirth?: string | null;
+
+  @IsOptional()
+  @IsIn(['active', 'inactive'])
+  status?: StudentStatus;
+}
+```
+
+`apps/api/src/transport/students/dto/student-response.dto.ts`:
+```ts
+import { Student, StudentStatus } from '../../../entities/student.entity';
+
+// An explicit allow-list, following the `toUserResponse` pattern Foundations
+// established: a column added to the entity later is not exposed by accident.
+export interface StudentResponseDto {
+  id: string;
+  admissionNumber: string;
+  fullName: string;
+  grade: string;
+  section: string | null;
+  dateOfBirth: string | null;
+  status: StudentStatus;
+}
+
+export function toStudentResponse(student: Student): StudentResponseDto {
+  return {
+    id: student.id,
+    admissionNumber: student.admissionNumber,
+    fullName: student.fullName,
+    grade: student.grade,
+    section: student.section,
+    dateOfBirth: student.dateOfBirth,
+    status: student.status,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/students/students.service.ts`:
+```ts
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { In } from 'typeorm';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { Student } from '../../entities/student.entity';
+import { AbacScopeService } from '../abac/abac-scope.service';
+import { CreateStudentDto } from './dto/create-student.dto';
+import { UpdateStudentDto } from './dto/update-student.dto';
+
+/** Postgres `unique_violation`. */
+const UNIQUE_VIOLATION = '23505';
+
+export interface Page<T> {
+  items: T[];
+  total: number;
+}
+
+/**
+ * Every write here needs a school to write into. A `super_admin` token carries
+ * `schoolId: null`, so it cannot create school-scoped rows; the controller's
+ * `@Roles('school_admin')` already prevents that call, and this check makes the
+ * invariant explicit rather than letting a null reach the database.
+ */
+export function requireSchoolId(claims: AccessTokenClaims): string {
+  if (!claims.schoolId) {
+    throw new BadRequestException('This operation requires a school-scoped account');
+  }
+  return claims.schoolId;
+}
+
+/**
+ * Turns a Postgres unique violation into a 409 and leaves every other error
+ * untouched, so an unexpected database failure still reaches the global filter
+ * as a 500 rather than being mislabelled a client mistake.
+ */
+export function asConflict(error: unknown, message: string): unknown {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: string }).code === UNIQUE_VIOLATION
+  ) {
+    return new ConflictException(message);
+  }
+  return error;
+}
+
+@Injectable()
+export class StudentsService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+    private readonly abacScopeService: AbacScopeService,
+  ) {}
+
+  async create(claims: AccessTokenClaims, dto: CreateStudentDto): Promise<Student> {
+    const schoolId = requireSchoolId(claims);
+    const manager = this.tenantContextService.getManager();
+
+    let student: Student;
+    try {
+      student = await manager.getRepository(Student).save({
+        schoolId,
+        admissionNumber: dto.admissionNumber,
+        fullName: dto.fullName,
+        grade: dto.grade,
+        section: dto.section ?? null,
+        dateOfBirth: dto.dateOfBirth ?? null,
+        status: 'active' as const,
+      });
+    } catch (error) {
+      throw asConflict(error, 'A student with that admission number already exists');
+    }
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'student.created',
+      entityType: 'student',
+      entityId: student.id,
+    });
+
+    return student;
+  }
+
+  /**
+   * The scope check runs before the existence check on purpose: an out-of-scope
+   * caller gets 403 for a real id and 403 for a made-up one alike, so the
+   * response never confirms that a given student exists.
+   */
+  async findById(claims: AccessTokenClaims, id: string): Promise<Student> {
+    await this.abacScopeService.assertCanReadStudent(claims, id);
+    const manager = this.tenantContextService.getManager();
+    const student = await manager.getRepository(Student).findOne({ where: { id } });
+    if (!student) {
+      throw new NotFoundException('Student not found');
+    }
+    return student;
+  }
+
+  async findAll(
+    claims: AccessTokenClaims,
+    limit: number,
+    offset: number,
+  ): Promise<Page<Student>> {
+    const scope = await this.abacScopeService.visibleStudentIds(claims);
+    const repository = this.tenantContextService.getManager().getRepository(Student);
+    const order = { admissionNumber: 'ASC' } as const;
+
+    if (scope.kind === 'all') {
+      const [items, total] = await repository.findAndCount({ take: limit, skip: offset, order });
+      return { items, total };
+    }
+
+    // An empty restricted scope short-circuits rather than reaching the
+    // database: `In([])` is not a reliable "match nothing" across TypeORM
+    // versions, and getting that wrong here would show a parent with no linked
+    // children every student in the school.
+    if (scope.studentIds.length === 0) {
+      return { items: [], total: 0 };
+    }
+
+    const [items, total] = await repository.findAndCount({
+      where: { id: In(scope.studentIds) },
+      take: limit,
+      skip: offset,
+      order,
+    });
+    return { items, total };
+  }
+
+  async update(
+    claims: AccessTokenClaims,
+    id: string,
+    dto: UpdateStudentDto,
+  ): Promise<Student> {
+    const schoolId = requireSchoolId(claims);
+    const repository = this.tenantContextService.getManager().getRepository(Student);
+
+    const existing = await repository.findOne({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException('Student not found');
+    }
+
+    // Fields are copied across one at a time rather than spread, because a
+    // spread of the DTO would write `undefined` over any column the caller
+    // simply did not mention.
+    const patch: Partial<Student> = {};
+    if (dto.fullName !== undefined) patch.fullName = dto.fullName;
+    if (dto.grade !== undefined) patch.grade = dto.grade;
+    if (dto.section !== undefined) patch.section = dto.section;
+    if (dto.dateOfBirth !== undefined) patch.dateOfBirth = dto.dateOfBirth;
+    if (dto.status !== undefined) patch.status = dto.status;
+
+    const deactivating = dto.status === 'inactive' && existing.status !== 'inactive';
+    const updated = await repository.save({ ...existing, ...patch });
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: deactivating ? 'student.deactivated' : 'student.updated',
+      entityType: 'student',
+      entityId: updated.id,
+    });
+
+    return updated;
+  }
+}
+```
+
+- [ ] **Step 5: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- students.service`
+Expected: PASS, 8 tests.
+
+- [ ] **Step 6: Prove the scoping test bites**
+
+Temporarily change `findAll` so the `restricted` branch falls through to the unrestricted query, and re-run. The "lists nothing for a parent with no linked children" test must **fail**. Restore and confirm it passes. Record both outputs.
+
+- [ ] **Step 7: Run the full suite and commit**
+
+```bash
+git add apps/api/src/transport/students/
+git commit -m "feat: add students service with ABAC-scoped reads and audited mutations"
+```
+
+---
+
+### Task 8: `StudentsController` and `StudentsModule`
+
+**Files:**
+- Create: `apps/api/src/transport/students/students.controller.ts`
+- Create: `apps/api/src/transport/students/students.module.ts`
+- Test: `apps/api/src/transport/students/students.controller.spec.ts`
+
+**Interfaces:**
+- Consumes: `StudentsService` and the DTOs from Task 7; `@Roles`, `@CurrentUser`, `PaginationQueryDto`, `PaginatedResponse`.
+- Produces: `StudentsController` exposing `POST /students`, `GET /students`, `GET /students/:id`, `PATCH /students/:id`; `StudentsModule` importing `AuthModule`, `AuditModule` and `TransportAbacModule` (created here, exporting `AbacScopeService`), declaring `StudentsController` and providing `StudentsService`.
+
+The ABAC provider needs its own module because Tasks 12 and 14 also consume it. Declaring it once and exporting it keeps a single instance rather than one copy per feature module.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/students/students.controller.spec.ts` — a unit test over a stubbed service, checking the controller's mapping and paging contract only. The role restrictions themselves are the `RolesGuard`'s job and are proved over HTTP in Task 16.
+
+```ts
+import { AccessTokenClaims } from '../../auth/token.service';
+import { Student } from '../../entities/student.entity';
+import { StudentsController } from './students.controller';
+import { StudentsService } from './students.service';
+
+describe('StudentsController', () => {
+  const claims: AccessTokenClaims = {
+    sub: 'user-1',
+    schoolId: 'school-1',
+    role: 'school_admin',
+    isSuperAdmin: false,
+  };
+
+  const student = {
+    id: 'student-1',
+    schoolId: 'school-1',
+    admissionNumber: 'ADM-1',
+    fullName: 'Aarav Nair',
+    grade: '5',
+    section: 'B',
+    dateOfBirth: null,
+    status: 'active',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  } as Student;
+
+  const service = {
+    create: jest.fn().mockResolvedValue(student),
+    findAll: jest.fn().mockResolvedValue({ items: [student], total: 1 }),
+    findById: jest.fn().mockResolvedValue(student),
+    update: jest.fn().mockResolvedValue(student),
+  } as unknown as StudentsService;
+
+  const controller = new StudentsController(service);
+
+  it('returns the response DTO and never the raw entity', async () => {
+    const result = await controller.create(claims, {
+      admissionNumber: 'ADM-1',
+      fullName: 'Aarav Nair',
+      grade: '5',
+    });
+
+    expect(result).toEqual({
+      id: 'student-1',
+      admissionNumber: 'ADM-1',
+      fullName: 'Aarav Nair',
+      grade: '5',
+      section: 'B',
+      dateOfBirth: null,
+      status: 'active',
+    });
+    expect(result).not.toHaveProperty('schoolId');
+  });
+
+  it('echoes the requested limit and offset in the page envelope', async () => {
+    const page = await controller.findAll(claims, { limit: 25, offset: 50 });
+
+    expect(page).toEqual({ items: [expect.objectContaining({ id: 'student-1' })], total: 1, limit: 25, offset: 50 });
+    expect(service.findAll).toHaveBeenCalledWith(claims, 25, 50);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- students.controller`
+Expected: FAIL — `Cannot find module './students.controller'`.
+
+- [ ] **Step 3: Write the ABAC module**
+
+`apps/api/src/transport/abac/abac.module.ts`:
+```ts
+import { Module } from '@nestjs/common';
+import { AbacScopeService } from './abac-scope.service';
+
+@Module({
+  providers: [AbacScopeService],
+  exports: [AbacScopeService],
+})
+export class TransportAbacModule {}
+```
+
+- [ ] **Step 4: Write the controller and module**
+
+`apps/api/src/transport/students/students.controller.ts`:
+```ts
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import { Roles } from '../../auth/decorators/roles.decorator';
+import { CurrentUser } from '../../auth/decorators/current-user.decorator';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { PaginatedResponse, PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import { StudentsService } from './students.service';
+import { CreateStudentDto } from './dto/create-student.dto';
+import { UpdateStudentDto } from './dto/update-student.dto';
+import { StudentResponseDto, toStudentResponse } from './dto/student-response.dto';
+
+@Controller('students')
+export class StudentsController {
+  constructor(private readonly studentsService: StudentsService) {}
+
+  @Roles('school_admin')
+  @Post()
+  async create(
+    @CurrentUser() user: AccessTokenClaims,
+    @Body() dto: CreateStudentDto,
+  ): Promise<StudentResponseDto> {
+    return toStudentResponse(await this.studentsService.create(user, dto));
+  }
+
+  // Read is open to every operational role; which rows come back is decided by
+  // AbacScopeService inside the service, not by this list.
+  @Roles('school_admin', 'parent', 'driver', 'attendant')
+  @Get()
+  async findAll(
+    @CurrentUser() user: AccessTokenClaims,
+    @Query() pagination: PaginationQueryDto,
+  ): Promise<PaginatedResponse<StudentResponseDto>> {
+    const { items, total } = await this.studentsService.findAll(
+      user,
+      pagination.limit,
+      pagination.offset,
+    );
+    return {
+      items: items.map(toStudentResponse),
+      total,
+      limit: pagination.limit,
+      offset: pagination.offset,
+    };
+  }
+
+  @Roles('school_admin', 'parent', 'driver', 'attendant')
+  @Get(':id')
+  async findOne(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<StudentResponseDto> {
+    return toStudentResponse(await this.studentsService.findById(user, id));
+  }
+
+  @Roles('school_admin')
+  @Patch(':id')
+  async update(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateStudentDto,
+  ): Promise<StudentResponseDto> {
+    return toStudentResponse(await this.studentsService.update(user, id, dto));
+  }
+}
+```
+
+`ParseUUIDPipe` matters beyond tidiness: without it a non-UUID path parameter reaches Postgres as `'abc'::uuid` and raises `invalid input syntax for type uuid`, which the global filter can only render as a 500. With it, the caller gets the 400 the mistake deserves.
+
+`apps/api/src/transport/students/students.module.ts`:
+```ts
+import { Module } from '@nestjs/common';
+import { AuthModule } from '../../auth/auth.module';
+import { AuditModule } from '../../audit/audit.module';
+import { TransportAbacModule } from '../abac/abac.module';
+import { StudentsController } from './students.controller';
+import { StudentsService } from './students.service';
+
+@Module({
+  imports: [AuthModule, AuditModule, TransportAbacModule],
+  controllers: [StudentsController],
+  providers: [StudentsService],
+  exports: [StudentsService],
+})
+export class StudentsModule {}
+```
+
+- [ ] **Step 5: Run the test and watch it pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- students.controller`
+Expected: PASS, 2 tests. Then the full suite twice, green both times.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add apps/api/src/transport/abac/abac.module.ts apps/api/src/transport/students/
+git commit -m "feat: expose students HTTP surface with role-gated endpoints"
+```
+
+---
+
+### Task 9: Guardian links
+
+**Files:**
+- Create: `apps/api/src/transport/students/guardians.service.ts`
+- Create: `apps/api/src/transport/students/dto/link-guardian.dto.ts`
+- Create: `apps/api/src/transport/students/dto/guardian-response.dto.ts`
+- Modify: `apps/api/src/transport/students/students.controller.ts` — add the two nested endpoints
+- Modify: `apps/api/src/transport/students/students.module.ts` — provide `GuardiansService`
+- Test: `apps/api/src/transport/students/guardians.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `StudentGuardian` and `GuardianRelationship` (Task 2); `User` and `UserRole` from `src/entities/user.entity`; `Student` (Task 1); `requireSchoolId` and `asConflict` exported by `students.service.ts` (Task 7); `AbacScopeService`.
+- Produces: `GuardiansService` with `link(claims, studentId, dto): Promise<StudentGuardian>` and `unlink(claims, studentId, guardianUserId): Promise<void>`; `LinkGuardianDto`; `GuardianResponseDto` + `toGuardianResponse`.
+
+**Why this is a separate task.** Linking a guardian is the operation that *grants* a parent visibility of a child — it is the write side of the rule Task 6 reads. Its tests are therefore the strongest available proof that ABAC is wired to real data: link a guardian, and the parent's scope grows by exactly one student; unlink, and it shrinks back.
+
+- [ ] **Step 1: Write the failing test**
+
+`apps/api/src/transport/students/guardians.service.spec.ts`:
+```ts
+import { randomUUID } from 'crypto';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { migrationDataSource } from '../../database/data-source.migration';
+import { appDataSourceOptions } from '../../database/data-source';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { AbacScopeService } from '../abac/abac-scope.service';
+import { GuardiansService } from './guardians.service';
+
+describe('GuardiansService', () => {
+  let dataSource: DataSource;
+  let tenantContextService: TenantContextService;
+  let abacScopeService: AbacScopeService;
+  let service: GuardiansService;
+
+  let schoolId: string;
+  let adminId: string;
+  let parentId: string;
+  let driverId: string;
+  let studentId: string;
+
+  const adminClaims = (): AccessTokenClaims => ({
+    sub: adminId,
+    schoolId,
+    role: 'school_admin',
+    isSuperAdmin: false,
+  });
+  const parentClaims = (): AccessTokenClaims => ({
+    sub: parentId,
+    schoolId,
+    role: 'parent',
+    isSuperAdmin: false,
+  });
+
+  const asSuperAdmin = <T>(work: () => Promise<T>): Promise<T> =>
+    tenantContextService.runWithTenant(
+      { sub: 'seed', schoolId: null, role: 'super_admin', isSuperAdmin: true },
+      work,
+    );
+
+  beforeAll(async () => {
+    const migrator = await migrationDataSource.initialize();
+    await migrator.runMigrations();
+    await migrator.destroy();
+
+    dataSource = await new DataSource(appDataSourceOptions).initialize();
+    tenantContextService = new TenantContextService(dataSource);
+    abacScopeService = new AbacScopeService(tenantContextService);
+    service = new GuardiansService(
+      tenantContextService,
+      new AuditService(tenantContextService),
+    );
+
+    await asSuperAdmin(async () => {
+      const manager = tenantContextService.getManager();
+      const [school] = await manager.query(
+        `INSERT INTO core.schools (name) VALUES ('Guardians School') RETURNING id`,
+      );
+      schoolId = school.id;
+
+      const insertUser = async (role: string, name: string): Promise<string> => {
+        const [row] = await manager.query(
+          `INSERT INTO core.users (school_id, role, email, password_hash, display_name)
+           VALUES ($1, $2, $3, 'x', $4) RETURNING id`,
+          [schoolId, role, `guardians-${role}-${randomUUID()}@example.com`, name],
+        );
+        return row.id;
+      };
+      adminId = await insertUser('school_admin', 'Admin');
+      parentId = await insertUser('parent', 'Parent');
+      driverId = await insertUser('driver', 'Driver');
+
+      const [student] = await manager.query(
+        `INSERT INTO transport.students (school_id, admission_number, full_name, grade, status)
+         VALUES ($1, $2, 'Meera Pillai', '3', 'active') RETURNING id`,
+        [schoolId, `ADM-${randomUUID().slice(0, 8)}`],
+      );
+      studentId = student.id;
+    });
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('grants the parent visibility of exactly the linked child', async () => {
+    const before = await tenantContextService.runWithTenant(parentClaims(), () =>
+      abacScopeService.visibleStudentIds(parentClaims()),
+    );
+    expect(before).toEqual({ kind: 'restricted', studentIds: [] });
+
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.link(adminClaims(), studentId, {
+        guardianUserId: parentId,
+        relationship: 'mother',
+        isPrimary: true,
+      }),
+    );
+
+    const after = await tenantContextService.runWithTenant(parentClaims(), () =>
+      abacScopeService.visibleStudentIds(parentClaims()),
+    );
+    expect(after).toEqual({ kind: 'restricted', studentIds: [studentId] });
+  });
+
+  it('defaults can_collect to true and records the link in the audit log', async () => {
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService.getManager().query(
+        `SELECT g.can_collect, g.is_primary, a.action, a.actor_user_id
+           FROM transport.student_guardians g
+           JOIN audit.audit_logs a ON a.entity_id = g.id
+          WHERE g.student_id = $1 AND g.guardian_user_id = $2`,
+        [studentId, parentId],
+      ),
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      can_collect: true,
+      is_primary: true,
+      action: 'guardian.linked',
+      actor_user_id: adminId,
+    });
+  });
+
+  it('rejects a second link between the same student and guardian', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.link(adminClaims(), studentId, {
+          guardianUserId: parentId,
+          relationship: 'father',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('rejects a guardian whose role is not parent', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.link(adminClaims(), studentId, {
+          guardianUserId: driverId,
+          relationship: 'guardian',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a link to a student that does not exist', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.link(adminClaims(), randomUUID(), {
+          guardianUserId: parentId,
+          relationship: 'mother',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('removes the parent visibility again on unlink, and audits it', async () => {
+    await tenantContextService.runWithTenant(adminClaims(), () =>
+      service.unlink(adminClaims(), studentId, parentId),
+    );
+
+    const scope = await tenantContextService.runWithTenant(parentClaims(), () =>
+      abacScopeService.visibleStudentIds(parentClaims()),
+    );
+    expect(scope).toEqual({ kind: 'restricted', studentIds: [] });
+
+    const rows = await asSuperAdmin(async () =>
+      tenantContextService
+        .getManager()
+        .query(`SELECT action FROM audit.audit_logs WHERE action = 'guardian.unlinked' AND school_id = $1`, [
+          schoolId,
+        ]),
+    );
+    expect(rows).toHaveLength(1);
+  });
+
+  it('raises NotFound when unlinking a guardian that was never linked', async () => {
+    await expect(
+      tenantContextService.runWithTenant(adminClaims(), () =>
+        service.unlink(adminClaims(), studentId, parentId),
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test and watch it fail**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- guardians.service`
+Expected: FAIL — `Cannot find module './guardians.service'`.
+
+- [ ] **Step 3: Write the DTOs**
+
+`apps/api/src/transport/students/dto/link-guardian.dto.ts`:
+```ts
+import { IsBoolean, IsIn, IsOptional, IsUUID } from 'class-validator';
+import { GuardianRelationship } from '../../../entities/student-guardian.entity';
+
+const RELATIONSHIPS: GuardianRelationship[] = [
+  'mother',
+  'father',
+  'grandparent',
+  'guardian',
+  'other',
+];
+
+export class LinkGuardianDto {
+  @IsUUID()
+  guardianUserId: string;
+
+  @IsIn(RELATIONSHIPS)
+  relationship: GuardianRelationship;
+
+  @IsOptional()
+  @IsBoolean()
+  isPrimary?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  canCollect?: boolean;
+}
+```
+
+`apps/api/src/transport/students/dto/guardian-response.dto.ts`:
+```ts
+import { GuardianRelationship, StudentGuardian } from '../../../entities/student-guardian.entity';
+
+// No name, email or phone. The guardian's contact details live on core.users
+// and are never joined into a transport response — spec §3 forbids exposing
+// them to drivers and attendants, and the safest way to honour that is for the
+// shape to have nowhere to put them.
+export interface GuardianResponseDto {
+  id: string;
+  studentId: string;
+  guardianUserId: string;
+  relationship: GuardianRelationship;
+  isPrimary: boolean;
+  canCollect: boolean;
+}
+
+export function toGuardianResponse(link: StudentGuardian): GuardianResponseDto {
+  return {
+    id: link.id,
+    studentId: link.studentId,
+    guardianUserId: link.guardianUserId,
+    relationship: link.relationship,
+    isPrimary: link.isPrimary,
+    canCollect: link.canCollect,
+  };
+}
+```
+
+- [ ] **Step 4: Write the service**
+
+`apps/api/src/transport/students/guardians.service.ts`:
+```ts
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { TenantContextService } from '../../tenancy/tenant-context.service';
+import { AuditService } from '../../audit/audit.service';
+import { AccessTokenClaims } from '../../auth/token.service';
+import { Student } from '../../entities/student.entity';
+import { StudentGuardian } from '../../entities/student-guardian.entity';
+import { User } from '../../entities/user.entity';
+import { LinkGuardianDto } from './dto/link-guardian.dto';
+import { asConflict, requireSchoolId } from './students.service';
+
+@Injectable()
+export class GuardiansService {
+  constructor(
+    private readonly tenantContextService: TenantContextService,
+    private readonly auditService: AuditService,
+  ) {}
+
+  async link(
+    claims: AccessTokenClaims,
+    studentId: string,
+    dto: LinkGuardianDto,
+  ): Promise<StudentGuardian> {
+    const schoolId = requireSchoolId(claims);
+    const manager = this.tenantContextService.getManager();
+
+    const student = await manager.getRepository(Student).findOne({ where: { id: studentId } });
+    if (!student) {
+      throw new NotFoundException('Student not found');
+    }
+
+    // A foreign key to core.users cannot express "must have role parent", so
+    // the check lives here (spec §6). RLS has already restricted this lookup to
+    // the caller's school, so a guardian from another tenant reads as absent.
+    const guardian = await manager
+      .getRepository(User)
+      .findOne({ where: { id: dto.guardianUserId } });
+    if (!guardian) {
+      throw new BadRequestException('Guardian user not found in this school');
+    }
+    if (guardian.role !== 'parent') {
+      throw new BadRequestException(
+        `Guardian must be a user with role 'parent', but this user has role '${guardian.role}'`,
+      );
+    }
+
+    let link: StudentGuardian;
+    try {
+      link = await manager.getRepository(StudentGuardian).save({
+        schoolId,
+        studentId,
+        guardianUserId: dto.guardianUserId,
+        relationship: dto.relationship,
+        isPrimary: dto.isPrimary ?? false,
+        canCollect: dto.canCollect ?? true,
+      });
+    } catch (error) {
+      throw asConflict(error, 'That guardian is already linked to this student');
+    }
+
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'guardian.linked',
+      entityType: 'student_guardian',
+      entityId: link.id,
+      metadata: { studentId, guardianUserId: dto.guardianUserId },
+    });
+
+    return link;
+  }
+
+  async unlink(
+    claims: AccessTokenClaims,
+    studentId: string,
+    guardianUserId: string,
+  ): Promise<void> {
+    const schoolId = requireSchoolId(claims);
+    const repository = this.tenantContextService
+      .getManager()
+      .getRepository(StudentGuardian);
+
+    const link = await repository.findOne({ where: { studentId, guardianUserId } });
+    if (!link) {
+      throw new NotFoundException('That guardian is not linked to this student');
+    }
+
+    // The audit row is written before the delete so it captures the link's id
+    // while the row still exists; both statements share the request
+    // transaction, so a failure in either leaves neither behind.
+    await this.auditService.record({
+      schoolId,
+      actorUserId: claims.sub,
+      action: 'guardian.unlinked',
+      entityType: 'student_guardian',
+      entityId: link.id,
+      metadata: { studentId, guardianUserId },
+    });
+
+    await repository.delete({ id: link.id });
+  }
+}
+```
+
+Unlinking is a genuine row delete, unlike students and assignments. The global constraint on soft deletion exists because assignment and enrolment history is read later by fee calculation and by operators reconstructing events; a revoked guardian link has no such downstream reader, and the audit row records that it happened.
+
+- [ ] **Step 5: Wire the endpoints into the controller**
+
+Add to `students.controller.ts` — the constructor gains `private readonly guardiansService: GuardiansService`, and:
+
+```ts
+  @Roles('school_admin')
+  @Post(':id/guardians')
+  async linkGuardian(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: LinkGuardianDto,
+  ): Promise<GuardianResponseDto> {
+    return toGuardianResponse(await this.guardiansService.link(user, id, dto));
+  }
+
+  @Roles('school_admin')
+  @HttpCode(204)
+  @Delete(':id/guardians/:guardianUserId')
+  async unlinkGuardian(
+    @CurrentUser() user: AccessTokenClaims,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('guardianUserId', ParseUUIDPipe) guardianUserId: string,
+  ): Promise<void> {
+    await this.guardiansService.unlink(user, id, guardianUserId);
+  }
+```
+
+Import `Delete` and `HttpCode` from `@nestjs/common`, plus `GuardiansService`, `LinkGuardianDto`, `GuardianResponseDto` and `toGuardianResponse`. The spec writes this path as `DELETE /students/:id/guardians`; the guardian's id has to appear somewhere, and a path segment is the conventional place for it.
+
+Then add `GuardiansService` to the `providers` array in `students.module.ts`.
+
+- [ ] **Step 6: Run the tests and watch them pass**
+
+Run: `set -a && . ./.env && set +a && pnpm --filter @transitos/api test -- guardians.service`
+Expected: PASS, 7 tests. Then the full suite twice, green both times.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/api/src/transport/students/
+git commit -m "feat: add guardian links granting parents scoped access to their children"
+```
